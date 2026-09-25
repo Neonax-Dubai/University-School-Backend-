@@ -1,0 +1,105 @@
+# Zayed University classroom CCTV inference (GPU). Exactly three cameras (camera_01..03),
+# read from the local MediaMTX broker; configuration comes from the Zayed dashboard backend.
+#
+#   docker compose -f docker-compose.yml up -d        # start / apply changes
+#   docker logs -f zayed-inference
+#
+# Prerequisites: tools/bootstrap_models.sh (models + TensorRT engines built on THIS GB10),
+# the MediaMTX stack (mediamtx/), the dashboard (../zayed_dashboard) and
+# runtime/dashboard_token (0600, from `manage.py seed_zayed --token-file`).
+# Nothing here records video: the NVR is the recording authority.
+name: zayed_inference
+
+services:
+  zayed-inference:
+    image: zayed/inference:25.11
+    container_name: zayed-inference
+    restart: unless-stopped
+    gpus: all
+    user: "1000:983"                  # stack:cctv - reads the 0660 model store, writes runtime/
+    working_dir: /app
+    entrypoint: ["/bin/sh", "/app/docker/run_inference.sh"]
+    read_only: true
+    tmpfs:
+      - /tmp:size=2g
+    shm_size: 1g
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 40s
+    environment:
+      HOME: /home/app
+      MPLCONFIGDIR: /tmp/matplotlib
+      XDG_CACHE_HOME: /tmp/.cache
+      # Backend and broker (service DNS names on dell_network)
+      DASHBOARD_URL: http://zayed-dashboard:8000
+      MEDIAMTX_BASE_URL: rtsp://mediamtx:8554
+      # Models: TensorRT engines built locally by tools/bootstrap_models.sh. The *_PT variables
+      # point at the ENGINE too, so a missing engine is a hard failure, never a silent .pt run.
+      ZAYED_ENGINE_DIR: /engines/zayed/current
+      POSE_L960_ENGINE: /engines/zayed/current/yolo26l-pose.engine
+      POSE_L960_MODEL_PT: /engines/zayed/current/yolo26l-pose.engine
+      FALL_POSE_MODEL: /engines/zayed/current/yolo26l-pose.engine
+      FALL_POSE_MODEL_PT: /engines/zayed/current/yolo26l-pose.engine
+      POSE_ADAPTER_MODEL: /engines/zayed/current/yolo26m-pose.engine
+      POSE_ADAPTER_MODEL_PT: /engines/zayed/current/yolo26m-pose.engine
+      TORCH_HOME: /models/zayed/torch
+      # Face identification (InsightFace buffalo_l under $HOME/.insightface) - GPU only
+      FACE_ID_REQUIRE_GPU: "1"
+      FACE_ID_QDRANT_HOST: qdrant
+      FACE_ID_QDRANT_PORT: "6333"
+      FACE_ID_QDRANT_COLLECTION: zayed_face_observations
+      FACE_ID_ALLOW_SHARED_QDRANT: "1"          # 6333 is the Zayed project's own Qdrant
+      KNOWN_PERSON_RECOGNITION_ENABLED: "1"
+      KNOWN_PERSON_QDRANT_HOST: qdrant
+      KNOWN_PERSON_QDRANT_PORT: "6333"
+      KNOWN_PERSON_QDRANT_COLLECTION: zayed_face_known_persons   # written by dashboard enrollment
+      KNOWN_PERSON_ALLOW_SHARED_QDRANT: "1"
+      # Re-ID (OSNet) - classroom group C101 comes from GET /api/ai/reid-groups/
+      REID_PROD_STORE: qdrant
+      REID_PROD_QDRANT_HOST: qdrant
+      REID_PROD_QDRANT_PORT: "6333"
+      REID_PROD_QDRANT_COLLECTION: zayed_person_reid
+      REID_PROD_ALLOW_SHARED_QDRANT: "1"
+      REID_OBSERVABILITY_OUTPUT_PATH: /app/runtime/reid_observability.jsonl
+      ANALYZE_LOG_PATH: /app/runtime/reid_similarity_log.jsonl
+      ANALYZE_CROPS_DIR: /app/runtime/reid_analyze_crops
+      # Evidence stills (no video) in SeaweedFS
+      SEAWEED_FILER_URL: http://seaweed-filer:8888
+      EVIDENCE_KEY_PREFIX: zayed-evidence
+      EVIDENCE_TTL: 30d
+      # Internal, GPU-only face API for the dashboard. Bound INSIDE the container only - there is
+      # deliberately no `ports:` entry, so it is reachable on dell_network and never from the host.
+      INTERNAL_FACE_API: "1"
+      INTERNAL_FACE_PORT: "8080"
+      INTERNAL_FACE_TOKEN_FILE: /app/runtime/internal_face_token
+      # Durable state under runtime/
+      CAMERA_CONFIG_CACHE: /app/runtime/cameras.cache.json
+      EVENT_OUTBOX_PATH: /app/runtime/outbox/events.sqlite3
+      METRICS_PATH: /app/runtime/metrics.json
+    volumes:
+      - ./:/app:ro
+      - ./runtime:/app/runtime:rw
+      - /mnt/cctv/models/zayed:/models/zayed:ro
+      - /mnt/cctv/models/zayed/insightface:/home/app/.insightface:ro
+      - /mnt/cctv/cache/tensorrt/zayed:/engines/zayed:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/app/runtime/metrics.json')<90 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - dell_network
+
+networks:
+  dell_network:
+    external: true

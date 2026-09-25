@@ -1,0 +1,62 @@
+# Zayed University MediaMTX broker.   Start:  docker compose -f mediamtx/docker-compose.yml up -d
+# Needs mediamtx.runtime.yml and relay.env first (./mediamtx/render_config.sh).
+name: zayed_mediamtx
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.0
+    container_name: zayed-mediamtx
+    hostname: mediamtx
+    restart: unless-stopped
+    user: "1000:1000"                   # stack: owner of the 0600 runtime config; no writes needed
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    command: ["/mediamtx.yml"]
+    volumes:
+      - { type: bind, source: ./mediamtx.runtime.yml, target: /mediamtx.yml, read_only: true }
+    ports:
+      - "127.0.0.1:8554:8554"           # RTSP, this host only
+      - "127.0.0.1:9997:9997"           # control API, this host only
+      - "127.0.0.1:9998:9998"           # Prometheus metrics, this host only
+    networks: [dell_network]            # inference reaches rtsp://mediamtx:8554/camera_0N
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+  # ---- one video-only relay per camera (see relay/relay.py for why) ----
+  relay-camera-01: &relay
+    build: ./relay
+    image: zayed/rtsp-relay:1
+    container_name: zayed-relay-camera-01
+    restart: unless-stopped
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    env_file: [./relay.env]              # NVR URLs + publish account (0600, git-ignored)
+    environment:
+      CAMERA: camera_01
+      MEDIAMTX_RTSP: rtsp://mediamtx:8554
+    depends_on: [mediamtx]
+    networks: [dell_network]
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  relay-camera-02:
+    <<: *relay
+    container_name: zayed-relay-camera-02
+    environment:
+      CAMERA: camera_02
+      MEDIAMTX_RTSP: rtsp://mediamtx:8554
+
+  relay-camera-03:
+    <<: *relay
+    container_name: zayed-relay-camera-03
+    environment:
+      CAMERA: camera_03
+      MEDIAMTX_RTSP: rtsp://mediamtx:8554
+
+networks:
+  dell_network:
+    external: true

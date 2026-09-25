@@ -1,0 +1,80 @@
+# =============================================================================================
+#  Zayed University - MediaMTX local RTSP broker (bluenviron/mediamtx:1.21.0)
+# =============================================================================================
+#  ROLE: pull each NVR main stream ONCE and re-serve it locally, credential-free, to the AI
+#  inference process (and any later local consumer) so nothing else connects to the NVR.
+#
+#  NOT a recorder. The NVR is the only recording system (~7 days). Recording and the playback
+#  server are OFF, and there is no recordings directory. Do not enable either.
+#
+#  WHY THE STREAMS ARE PUBLISHED, NOT PULLED. The NVR's SDP declares each audio track as
+#  MPEG4-GENERIC with no fmtp/config line, which MediaMTX rejects for the whole session
+#  ("invalid SDP: media 2 is invalid: config is missing"). One relay per camera
+#  (relay/relay.py) pulls the H.264 track only, remuxes it without decoding and publishes it
+#  here. The NVR credentials live only in relay.env (0600, git-ignored); this file is a
+#  TEMPLATE whose relay-password placeholder render_config.sh fills with a SHA-256 hash into
+#  mediamtx.runtime.yml (0600, git-ignored). No credential is in git or in any command line.
+# =============================================================================================
+
+logLevel: info
+logDestinations: [stdout]
+
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 1024
+
+# ------------------------------------------------------------------ authentication
+# Only the relay account may PUBLISH, and only from the local Docker network; a second
+# publisher cannot take over a path (overridePublisher: false). Read from this host and
+# dell_network; the control API and metrics from the HOST only.
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1", "172.18.0.0/16"]
+    permissions:
+      - action: read
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1", "172.18.0.1"]    # the HOST only (published ports arrive via the
+    permissions:                              # dell_network gateway); no container may reconfigure
+      - action: api                           # MediaMTX, e.g. switch recording on
+      - action: metrics
+  - user: __RELAY_PUBLISH_USER__
+    pass: __RELAY_PUBLISH_PASS_SHA256__
+    ips: ["172.18.0.0/16"]
+    permissions:
+      - action: publish
+
+# ------------------------------------------------------------------ control / monitoring
+api: true
+apiAddress: :9997
+metrics: true
+metricsAddress: :9998
+pprof: false
+playback: false            # playback serves recordings - there are none, by design
+
+# ------------------------------------------------------------------ protocols
+rtsp: true
+rtspTransports: [tcp]      # TCP interleaved only: no UDP port range to open
+rtspEncryption: "no"
+rtspAddress: :8554
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false                 # Media over QUIC is on by default in 1.21; not used here
+
+# ------------------------------------------------------------------ paths
+pathDefaults:
+  record: false            # NEVER true: the NVR is the recording authority
+  overridePublisher: false # the running relay keeps its path; nobody can hijack it
+  maxReaders: 8
+
+paths:
+  camera_01:
+    source: publisher        # relay-camera-01 (NVR channel 101)
+  camera_02:
+    source: publisher        # relay-camera-02 (NVR channel 201)
+  camera_03:
+    source: publisher        # relay-camera-03 (NVR channel 301)

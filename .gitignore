@@ -1,0 +1,25 @@
+# secrets
+.env
+*.env
+!.env.example
+mediamtx/mediamtx.runtime.yml
+mediamtx/relay.env
+# runtime / generated
+__pycache__/
+*.pyc
+*.log
+*.log.*
+runtime/
+outbox/
+evidence_out/
+# models and engines live under /mnt/cctv, never in git
+*.pt
+*.engine
+*.onnx
+*.pth
+*.keras
+models/
+# no recordings, ever
+recordings/
+*.mp4
+*.mkv

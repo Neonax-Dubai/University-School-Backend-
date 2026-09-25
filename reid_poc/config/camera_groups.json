@@ -1,0 +1,9 @@
+{
+  "groups": {
+    "C101": {
+      "cameras": ["camera_01", "camera_02", "camera_03"],
+      "similarity_threshold": 0.75,
+      "min_match_margin": 0.08
+    }
+  }
+}

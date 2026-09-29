@@ -4,7 +4,7 @@
 |---|---|
 | Algorithm validation | **PASS**: unit scenarios, the Dubai regression suite, and an isolated replay of the real Event 32 footage |
 | C101 staged fall validation | **PENDING**: no genuine fall has ever been recorded in C101 (procedure in §9) |
-| Production deployment | **NOT DEPLOYED**: waiting for operator approval (§10) |
+| Production deployment | **DEPLOYED** 2026-09-29 at 14:00:43Z, with the operator's approval. Branch `zayed-poc-remediation` @ `7e0512b` is checked out in the production checkout, and a 48 h observation is running (§10). |
 
 Branch `zayed-poc-remediation`. The only code change is in `fall_pose_policy.py`; `fall_pose_adapter.py`, `zayed_inference.py` and the dashboard are untouched.
 
@@ -206,36 +206,53 @@ For each run, record:
 - the `down_rule`, `lower_body_evidence`, drops and axis from the metadata or the `[FALL-POSE]` shadow log;
 - the latency from landing.
 
-## 10. Deployment procedure (after approval)
+## 10. Deployment (done 2026-09-29, with the operator's approval)
 
-1. **Preconditions.**
-   - The Phase 1 tests pass.
-   - The replay and regression results above have been reviewed.
-   - The commit has been reviewed.
-   - An operator has approved.
-   - **No other session is replaying into MediaMTX or testing cameras.** Check the MediaMTX log and `docker ps` for publisher containers.
-2. **Record the pre-deploy metrics.** `python3 -m json.tool runtime/metrics.json` gives fps, latency, failures and the `fall_pose` counters; `nvidia-smi` gives the GPU.
-3. **Fast-forward production to the branch.** The live container bind-mounts this working tree.
+The chosen workflow is **branches in the production checkout**, not separate worktrees and not a merge. `main` stays at `ba1a578`, and nothing is pushed.
+
+1. **Checked before starting**
+   - MediaMTX publishers were exactly the three relays (IPs matched), with no publisher change in the previous 90 min.
+   - `zayed-inference` had last restarted at 12:02Z.
+   - The production checkout was clean apart from the owner's untracked `tst.txt`.
+   - The only other active session was running Django tests in an isolated network (`ztest-net-*`), mounting `zayed_dashboard/` read-only. It was unaffected by an inference restart.
+2. **Recorded before** (`ops/phase1_fall_observation/pre_deploy_snapshot.json`, 13:59:38Z):
+   - `main` @ `ba1a578`; 29.69 fps, 9.9 per camera; inference p50/p95 16.1/25.0 ms; end-to-end p50/p95 41.5–45.6 / 71–84 ms; 0 predict failures.
+   - GPU 13%, 4,661 MiB plus 3 × 336 MiB; CPU 3.35 cores; RAM 4.41 GiB.
+   - One open tamper incident on camera_02, since 13:01:06Z, raised during a lighting change that camera_01 and camera_03 correctly absorbed.
+3. **Switched the branch.** The remediation worktree was detached first, to free the branch.
 
    ```bash
-   git -C /home/stack/Zayed_University/zayed_ai_inferencing merge --ff-only zayed-poc-remediation
+   git -C /home/stack/Zayed_University/zayed_ai_inferencing checkout zayed-poc-remediation   # HEAD 7e0512b
    ```
-4. **Restart inference.** All three cameras lose analytics for about 1–2 minutes: a graceful stop of up to 40 s (on 09-29 it ran over and was SIGKILLed), then engine load.
 
-   ```bash
-   docker restart zayed-inference
-   ```
-5. **Verify.**
-   - The log shows `[FALL-POSE] camera configuration: CAMERA_01=ON, …` and three `Connected (2592x1944 … NVDEC)` lines.
-   - Within 2 minutes `[STATUS]` shows fps ≈ 29.7 and `predict_failures=0`.
-   - `metrics.json` shows `fall_pose_worker_errors` 0.
-6. **Compare** fps, latency, GPU, CPU and RAM against step 2. Watch fall events and alarms for 24–48 h.
+   `git diff main..zayed-poc-remediation` changes one runtime Python file, `fall_pose_policy.py`; the rest is `docs/` and `tests/fall/`.
+4. **Restarted inference only**, with `docker restart zayed-inference`:
+
+   | Time (Z) | Event |
+   |---|---|
+   | 14:00:43.4 | Restart issued |
+   | 14:00:47.3 | Container running (graceful stop about 4 s, no SIGKILL) |
+   | 14:00:55 | All three cameras connected |
+   | 14:01:14.7 | Inference running |
+   | 14:01:25 | First analysed frames |
+   | 14:02:15.9 | Full rate, 29.67 fps, 99 frames per 10 s on every camera |
+
+   Analytics were fully back **about 92 s** after the restart command.
+
+   During warm-up, MediaMTX dropped the camera_01 reader with `write … i/o timeout` at 14:01:32. It reconnected in about 7 s, and camera health logged signal loss raise and recover as a diagnostic, with no event. The 12:02Z restart on the old code showed the same transient on all three cameras, so it is **pre-existing** and logged as a separate item.
+5. **Verified after** (`post_deploy_snapshot.json`, 14:04:31Z):
+   - The container is healthy with 0 errors in 200 log lines.
+   - The deployed file sets hold 1.0 s, hip 1.0, shoulder 2.0. It was checked out 40 s before the process started.
+   - 29.60–29.67 fps, 9.9 per camera; inference p50/p95 16.4/25.9 ms; end-to-end p50/p95 41.9–46.6 / 75–82 ms; predict, camera and fall-worker errors 0.
+   - CPU 3.36 cores.
+   - GPU 7%, 2,055 MiB, and RAM 3.16 GiB are lower only because the pose and face models load lazily on the first person; they are to be re-compared during the observation.
+   - 0 FALL events since deployment. Event 32 and its critical alarm are untouched.
+6. **Observation.** `ops/phase1_fall_observation/observe.sh` takes a read-only snapshot every 5 min until 2026-10-01T14:00:43Z; `summarize.py --db` gives the report. The camera_02 tamper incident's in-memory state was lost with the restart, so its dashboard alarm stays open for operator review.
 
 ## 11. Rollback
 
 ```bash
-cd /home/stack/Zayed_University/zayed_ai_inferencing
-git revert --no-edit <phase-1 commit>        # or: git checkout ba1a578 -- fall_pose_policy.py
+git -C /home/stack/Zayed_University/zayed_ai_inferencing checkout main    # back to ba1a578
 docker restart zayed-inference
 ```
 

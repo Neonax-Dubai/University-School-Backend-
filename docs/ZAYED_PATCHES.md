@@ -2,8 +2,9 @@
 
 Baseline: `dubai_ai_inferncing` at commit `5b192cef` (frozen, never modified).
 `DUBAI_BASELINE_CHECKSUMS.txt` holds the SHA-256 prefix of every copied file **as it is in
-Dubai**. 26 of the 32 copied files are still byte-identical to it. The six below were changed
-on purpose, and each change is marked `ZAYED` in the source.
+Dubai**. 24 of the 32 copied files are still byte-identical to it. The eight below were changed
+on purpose. Each change is marked `ZAYED` in the source, except `cctv.py`'s stall watchdog
+(see its row).
 
 Verify at any time:
 
@@ -11,7 +12,7 @@ Verify at any time:
 cd zayed_ai_inferencing
 while read -r sum f; do [ "$(sha256sum "$f" | cut -c1-16)" = "$sum" ] || echo "changed: $f"; done \
   < <(grep -E '^[0-9a-f]{16}  ' docs/DUBAI_BASELINE_CHECKSUMS.txt)
-# expected output: exactly the six files listed below
+# expected output: exactly the eight files listed below
 ```
 
 | File | Change | Why |
@@ -22,12 +23,15 @@ while read -r sum f; do [ "$(sha256sum "$f" | cut -c1-16)" = "$sum" ] || echo "c
 | `known_person.py` | `KNOWN_PERSON_ALLOW_SHARED_QDRANT` opt-in for port 6333. | On the Zayed GB10, 6333 is the project's own Qdrant (the same opt-in face ID and Re-ID already had). |
 | `face_id_manager.py` | `_require_gpu()` after `FaceAnalysis.prepare()` (`FACE_ID_REQUIRE_GPU`, default on). | ONNX Runtime silently falls back to CPU when CUDA fails. Zayed refuses that. |
 | `face_id_adapter.py` | `camera_armed()` and `submit()` upper-case the camera id before the membership test (as `fall_pose_adapter` and `fight_adapter` already do). | `set_enabled_cameras()` stores upper-case ids. Dubai ids (`CAM-R25`) were already upper case, so the bug never showed. With Zayed's `camera_01`, face ID observed nothing. Found live on 2026-09-22. |
+| `cctv.py` | Per-camera stall watchdog: an ffmpeg that is alive but has produced no frame for `CCTV_STALL_TIMEOUT_SECONDS` (20 s) is killed, so the reader's existing reconnect path runs; `stalls_recovered` in `get_stats()`. Tests: `tests/unit/test_cctv_stall.py`. Not marked `ZAYED` in the source. | A decoder that goes quiet without exiting parked the reader for hours (2026-09-24, twice). Committed in `ba1a578` ("before remediation"); this row was added in the fall remediation because the log had not recorded it. |
+| `fall_pose_policy.py` | Lower-body evidence for every "down" rule: the ankle axis, else the knee->shoulder axis, else hips and shoulders must both have dropped towards the floor from the person's last upright pose (`HIP_DROP_MIN_RATIO` 1.0, `SHOULDER_DROP_MIN_RATIO` 2.0 upright torso lengths). `CONFIRM_SECONDS` 0.3 -> 1.0. New event metadata (`down_rule`, `lower_body_evidence`, drops, `policy_revision`). | Event 32 (2026-09-28): a person bending over a desk raised a critical "Person Fell". The desk hid the ankles, so Dubai fell back to the torso alone and the ground rule trusted a desk-truncated box. `docs/ZAYED_FALL_REMEDIATION.md`. |
 
 New Zayed files (not in Dubai): `zayed_inference.py`, `outbox.py`, `occupancy.py`,
 `identity_supervisor.py`, `internal_api.py`, `phone_use.py`, `sleeping.py`, `evacuation.py`, `floor_plan.py`,
 `camera_health/`, `reid_poc/config/camera_groups.json`, `mediamtx/`, `docker/`,
 `docker-compose.yml`, `tools/bootstrap_models.*`, `tests/camera_health/run_acceptance.sh`,
-`tests/unit/`, `tests/resilience/`.
+`tests/unit/`, `tests/resilience/`, `tests/fall/` (fall scenarios, Dubai regression runner,
+isolated clip replay).
 
 Zayed behaviour that is set from `zayed_inference.py` rather than by patching a module:
 `evidence.ALARM_EVIDENCE_TYPES` gains `MOBILE_PHONE_DETECTED`, `SLEEPING_DETECTED`,

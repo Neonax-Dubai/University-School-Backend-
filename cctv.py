@@ -49,6 +49,24 @@ RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "tcp")
 # slot per camera (about 6 MB), so 8 slots on 10 cameras is under 500 MB.
 QUEUE_SIZE = int(os.getenv("CCTV_QUEUE_SIZE", "8"))
 
+#: How long a connected camera may produce NOTHING before its decoder is considered stuck.
+#:
+#: This is the failure this project actually suffers. _read_exact() blocks on the ffmpeg pipe
+#: with no timeout, and the reader's reconnect logic sits at the TOP of the loop - reachable
+#: only when ffmpeg EXITS and closes stdout. An ffmpeg that is alive but emitting nothing (an
+#: RTSP session that died without an EOF, a wedged NVDEC) therefore parks the reader thread in
+#: read() for ever: the camera goes silent, inference stays "running" with its watchdog
+#: satisfied, and only restarting the whole container recovers it. Seen twice in production -
+#: 2026-09-24 03:34 (two cameras, five hours) and 2026-09-24 22:43 (all three, twelve hours).
+#:
+#: 20 s is well past any legitimate gap: these cameras deliver 30 fps, the camera-health
+#: detector already calls 5 s a signal loss, and MediaMTX republishes within a second or two
+#: of a relay hiccup.
+STALL_TIMEOUT_SECONDS = float(os.getenv("CCTV_STALL_TIMEOUT_SECONDS", "20"))
+
+#: How often the watchdog looks. Cheap: one timestamp comparison per camera.
+STALL_CHECK_SECONDS = float(os.getenv("CCTV_STALL_CHECK_SECONDS", "5"))
+
 USE_NVDEC = os.getenv("CCTV_NVDEC", "1") == "1"
 FFMPEG_LOG = os.getenv("CCTV_FFMPEG_LOG", "0") == "1"
 
@@ -91,6 +109,10 @@ class CameraStream:
         # Statistics
         self.frames_read = 0
         self.frames_dropped = 0
+        #: When this camera last produced a frame. The stall watchdog reads it; the reader
+        #: thread writes it. A float assignment is atomic under the GIL, so no lock.
+        self.last_frame_at = time.time()
+        self.stalls_recovered = 0
 
         # Probe-failure log throttle. A camera that is off writes one line every
         # reconnect_delay seconds otherwise - CAM-R16 alone put tens of
@@ -246,6 +268,35 @@ class CameraStream:
             buf += chunk
         return buf
 
+    def _watchdog(self):
+        """
+        Kill an ffmpeg that has stopped producing, so the reader can reconnect.
+
+        Deliberately does NOT try to make the read non-blocking or restructure the reader.
+        Closing the process closes its stdout, the blocked read() returns empty, _read_exact()
+        returns None, and the reader's OWN reconnect path - the one that already works when
+        ffmpeg exits normally - runs exactly as it always has. One camera at a time: a stalled
+        camera never touches another camera's decoder.
+        """
+        while self.running:
+            time.sleep(STALL_CHECK_SECONDS)
+            if not self.running:
+                return
+            proc = self.proc
+            if proc is None or proc.poll() is not None:
+                continue                      # not connected, or already exited: reader's job
+            idle = time.time() - self.last_frame_at
+            if idle < STALL_TIMEOUT_SECONDS:
+                continue
+            self.stalls_recovered += 1
+            print(f"[{self.camera_id}] no frames for {idle:.0f}s while the decoder is alive - "
+                  f"killing it so the stream reconnects (stall #{self.stalls_recovered})",
+                  flush=True)
+            # Reset first: _close_proc can take a moment, and the reader needs a fresh
+            # deadline the instant it reconnects or this fires again immediately.
+            self.last_frame_at = time.time()
+            self._close_proc()
+
     def start(self):
         # Connect INSIDE the reader thread, not here. The probe blocks for the
         # full ffprobe timeout whenever a camera's MediaMTX source is momentarily
@@ -256,8 +307,14 @@ class CameraStream:
         # already (re)connects and retries, so startup stays instant and every
         # camera comes up independently and self-heals.
         self.running = True
+        self.last_frame_at = time.time()
         self.thread = threading.Thread(target=self._reader, daemon=True)
         self.thread.start()
+        # Its own thread: the reader spends its life blocked in read(), so it cannot possibly
+        # notice that it is blocked. Daemon, so it never holds up shutdown.
+        self.watchdog_thread = threading.Thread(
+            target=self._watchdog, name=f"stall-watchdog-{self.camera_id}", daemon=True)
+        self.watchdog_thread.start()
 
     def _reader(self):
         while self.running:
@@ -303,6 +360,7 @@ class CameraStream:
 
                 self.frames_read += 1
                 self.frame_id += 1
+                self.last_frame_at = time.time()
 
                 packet = {
                     "camera_id": self.camera_id,
@@ -381,6 +439,9 @@ class CameraStream:
             "camera_id": self.camera_id,
             "frames_read": self.frames_read,
             "frames_dropped": self.frames_dropped,
+            # How many times this camera's decoder had to be killed for going quiet. A rising
+            # number means the stream is unstable even though the camera looks healthy.
+            "stalls_recovered": self.stalls_recovered,
             "queue_size": self.queue_size(),
             "decoder": self.decoder,
         }

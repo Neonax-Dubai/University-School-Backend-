@@ -12,6 +12,7 @@ __pycache__/
 runtime/
 outbox/
 evidence_out/
+zayed_test_recordings/
 # models and engines live under /mnt/cctv, never in git
 *.pt
 *.engine

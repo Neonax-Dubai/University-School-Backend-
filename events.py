@@ -54,7 +54,9 @@ ZAYED_EVENT_TYPES = {
     "violence_detected": "FIGHT_DETECTED",
     "fall_detected": "FALL_DETECTED",
     "abandoned_object": "UNATTENDED_OBJECT_DETECTED",
-    "crowd_detected": "OVERCROWDING_DETECTED",
+    # crowd_detected is NOT mapped: it is a per-camera, per-zone person threshold, not the classroom
+    # against its capacity. Mapped, one crowd raised up to one "Classroom Over Capacity" alarm per
+    # camera. OVERCROWDING_DETECTED comes only from occupancy.py; zone crowds stay crowd_detected.
     "camera_tamper": "CAMERA_TAMPERING_DETECTED",
 }
 

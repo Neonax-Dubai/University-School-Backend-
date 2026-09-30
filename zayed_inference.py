@@ -652,7 +652,7 @@ def process_result(result, metadata, source_frame):
                                            scope=crowd_metadata.get("zone_id"))
 
     people_counter_instance.observe(camera_id, tracked_objects, frame_width, frame_height)
-    occupancy_instance.observe(camera_id, tracked_objects, observed_at)
+    occupancy_instance.observe(camera_id, tracked_objects, observed_at, frame_width, frame_height)
 
     persons = [t for t in tracked_objects if t.group == tracking.PERSON_GROUP]
     floor_mapper.observe(camera_id, persons, observed_at)

@@ -11,8 +11,18 @@ window; per classroom it forms ONE occupancy figure:
   method "floor_fusion" once EVERY camera of the classroom has a floor-plan homography: people
                         projected onto the floor and fused across cameras (floor_plan.py), the
                         median over the window.
+  method "zone_ownership" when the operator has drawn OCCUPANCY zones (the existing dashboard
+                        Zone, rules["occupancy"]): each such zone is an ownership region, drawn so
+                        that no part of the room belongs to two cameras. Per camera, the person
+                        tracks whose anchor point (zones.anchor_point, the zone convention) lies
+                        inside one of its occupancy zones are counted once each; the classroom is
+                        the SUM of those per-camera medians. A camera of that classroom with no
+                        occupancy zone (C101's faculty view) is not counted at all. Takes
+                        precedence over the other two methods for that classroom. The result is
+                        OBSERVED occupancy: people outside every ownership zone are not counted.
 
-Capacity is the backend's (classroom.capacity in the camera payload). With capacity set:
+Capacity is the backend's (classroom.capacity in the camera payload). With capacity set (and,
+for a classroom counted in occupancy zones, only once one of them carries rules["overcrowding"]):
 
   OVERCROWDING_DETECTED  occupancy above capacity * overcrowding_threshold_pct for
                          OVERCROWD_SECONDS; re-armed only after it has dropped back below for
@@ -31,6 +41,8 @@ import time
 
 import requests
 
+import zones as zone_geometry
+
 WINDOW_SECONDS = float(os.getenv("OCCUPANCY_WINDOW_SECONDS", "10"))
 PUBLISH_SECONDS = float(os.getenv("OCCUPANCY_PUBLISH_SECONDS", "10"))
 OVERCROWD_SECONDS = float(os.getenv("OVERCROWD_SECONDS", "30"))
@@ -38,6 +50,9 @@ OVERCROWD_CLEAR_SECONDS = float(os.getenv("OVERCROWD_CLEAR_SECONDS", "60"))
 OCCUPANCY_EVENT_DELTA = int(os.getenv("OCCUPANCY_EVENT_DELTA", "3"))
 OCCUPANCY_EVENT_MIN_SECONDS = float(os.getenv("OCCUPANCY_EVENT_MIN_SECONDS", "60"))
 PERSON_GROUP = "person"
+#: Zone.rules keys (the dashboard's zone modal): an occupancy ownership zone, and whether its
+#: classroom raises OVERCROWDING_DETECTED.
+OCCUPANCY_RULE, OVERCROWDING_RULE = "occupancy", "overcrowding"
 
 
 class ClassroomOccupancy:
@@ -52,6 +67,9 @@ class ClassroomOccupancy:
         self._last_event = {}                 # classroom -> (t, occupancy)
         self.events_emitted = 0
         self._fusion = None                   # floor_plan.FloorPlanMapper, when installed
+        self._owner_zones = {}                # camera -> [polygon] of its occupancy zones
+        self._zone_classrooms = set()         # classrooms counted in occupancy zones
+        self._overcrowding_classrooms = set() # ... of those, the ones that raise overcrowding
 
     def set_fusion(self, provider):
         """provider.fused_counts(classroom_id, now, window) -> [counts] | None (not fully mapped)."""
@@ -63,11 +81,40 @@ class ClassroomOccupancy:
                                       for c in camera_configs if (c.classroom or {}).get("classroom_id")}
             self._classrooms = {(c.classroom or {})["classroom_id"]: dict(c.classroom)
                                 for c in camera_configs if (c.classroom or {}).get("classroom_id")}
+            owners, overcrowding = {}, set()
+            for c in camera_configs:
+                classroom_id = self._camera_classroom.get(c.camera_id)
+                zones = [z for z in (getattr(c, "zones", None) or [])
+                         if isinstance(z, dict) and z.get("enabled", True)
+                         and (z.get("rules") or {}).get(OCCUPANCY_RULE)
+                         and isinstance(z.get("coordinates"), list) and len(z["coordinates"]) >= 3]
+                if classroom_id and zones:
+                    owners[c.camera_id] = [z["coordinates"] for z in zones]
+                    if any((z.get("rules") or {}).get(OVERCROWDING_RULE) for z in zones):
+                        overcrowding.add(classroom_id)
+            self._owner_zones = owners
+            self._zone_classrooms = {self._camera_classroom[c] for c in owners}
+            self._overcrowding_classrooms = overcrowding
 
-    def observe(self, camera_id, tracked_objects, now):
-        if camera_id not in self._camera_classroom:
+    def observe(self, camera_id, tracked_objects, now, frame_width=0, frame_height=0):
+        classroom_id = self._camera_classroom.get(camera_id)
+        if classroom_id is None:
             return
-        count = sum(1 for t in tracked_objects if t.group == PERSON_GROUP)
+        if classroom_id in self._zone_classrooms:
+            polygons = self._owner_zones.get(camera_id)
+            if not polygons:
+                return                       # no ownership zone on this camera: it is not counted
+            count = 0
+            for t in tracked_objects:
+                if t.group != PERSON_GROUP:
+                    continue
+                point = zone_geometry.anchor_point(t.bbox, frame_width, frame_height)
+                # One track counts once, however many of this camera's occupancy zones hold it.
+                if point is not None and any(zone_geometry.point_in_polygon(point[0], point[1], polygon)
+                                             for polygon in polygons):
+                    count += 1
+        else:
+            count = sum(1 for t in tracked_objects if t.group == PERSON_GROUP)
         with self._lock:
             window = self._counts[camera_id]
             window.append((now, count))
@@ -80,22 +127,33 @@ class ClassroomOccupancy:
         with self._lock:
             for classroom_id, classroom in self._classrooms.items():
                 per_camera, medians, maxima = {}, [], []
+                zoned = classroom_id in self._zone_classrooms
                 for camera_id, cid in self._camera_classroom.items():
                     if cid != classroom_id:
                         continue
+                    if zoned and camera_id not in self._owner_zones:
+                        continue                 # excluded (no ownership zone), not "not reporting"
                     window = [n for t, n in self._counts.get(camera_id, ()) if now - t <= WINDOW_SECONDS]
                     if not window:
                         per_camera[camera_id] = None
                         continue
-                    per_camera[camera_id] = window[-1]
-                    medians.append(int(statistics.median(window)))
+                    median = int(statistics.median(window))
+                    # Zones: each camera's share of the sum. Otherwise the camera's latest frame.
+                    per_camera[camera_id] = median if zoned else window[-1]
+                    medians.append(median)
                     maxima.append(max(window))
-                occupancy = max(medians) if medians else None
-                occupancy_max = max(maxima) if maxima else None
-                method = "max_camera"
-                fused = self._fusion.fused_counts(classroom_id, now, WINDOW_SECONDS) if self._fusion else None
-                if fused:
-                    occupancy, occupancy_max, method = int(statistics.median(fused)), max(fused), "floor_fusion"
+                if zoned:
+                    # The ownership zones partition the room, so the per-camera shares add up.
+                    occupancy = sum(medians) if medians else None
+                    occupancy_max = sum(maxima) if maxima else None
+                    method = "zone_ownership"
+                else:
+                    occupancy = max(medians) if medians else None
+                    occupancy_max = max(maxima) if maxima else None
+                    method = "max_camera"
+                    fused = self._fusion.fused_counts(classroom_id, now, WINDOW_SECONDS) if self._fusion else None
+                    if fused:
+                        occupancy, occupancy_max, method = int(statistics.median(fused)), max(fused), "floor_fusion"
                 rows.append({"classroom_id": classroom_id, "measured_at": now, "window_seconds": WINDOW_SECONDS,
                              "occupancy": occupancy,
                              "occupancy_max": occupancy_max,
@@ -111,6 +169,7 @@ class ClassroomOccupancy:
         for row in self.snapshot(now):
             cid, occ, capacity = row["classroom_id"], row["occupancy"], row["capacity"]
             if occ is None:
+                self._over_since.pop(cid, None)  # unknown: the hold starts again when counting resumes
                 continue
             pct = round(100.0 * occ / capacity, 1) if capacity else None
             last = self._last_event.get(cid)
@@ -119,6 +178,9 @@ class ClassroomOccupancy:
                 out.append(("OCCUPANCY_UPDATED", cid, {"occupancy": occ, "capacity": capacity, "occupancy_pct": pct,
                                                         "method": row["method"], "per_camera": row["per_camera"]}))
             if not capacity:
+                continue
+            if cid in self._zone_classrooms and cid not in self._overcrowding_classrooms:
+                self._over_since.pop(cid, None)  # occupancy zones without the Overcrowding use case
                 continue
             over = pct > row["threshold_pct"]
             if over:

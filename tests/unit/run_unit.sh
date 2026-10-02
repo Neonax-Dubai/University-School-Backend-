@@ -8,7 +8,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 docker run --rm --network none --user "$(id -u):$(id -g)" -e PYTHONDONTWRITEBYTECODE=1 -e HOME=/tmp \
   -v "$ROOT":/app:ro -w /app/tests/unit --entrypoint /bin/bash "${ZAYED_TEST_IMAGE:-zayed/inference:25.11}" -c '
 set -u -o pipefail; status=0
-for t in test_phone_use test_sleeping test_evacuation test_floor_plan test_occupancy_zones test_cctv_stall; do
+for t in test_phone_use test_sleeping test_evacuation test_floor_plan test_occupancy_zones test_abandoned_spot_continuity test_unattended_episodes test_cctv_stall; do
   echo "== $t"; python -m unittest "$t" 2>&1 | tail -4 || status=1
 done
 exit $status' 2>&1 | grep -E "^(==|Ran|OK|FAILED|ERROR|FAIL:|AssertionError|Traceback|  File)"

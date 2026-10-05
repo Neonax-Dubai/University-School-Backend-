@@ -63,7 +63,8 @@ class TrackerTests(unittest.TestCase):
         self.assertIsNone(decision, "writing / reaching is not sleeping")
 
     def test_short_episode_does_not_raise(self):
-        decision, _ = self.run_track(lambda i: True, seconds=60)
+        # Shorter than the configured window (it was 60 s against the original 120 s window).
+        decision, _ = self.run_track(lambda i: True, seconds=S.SLEEP_SECONDS * 0.8)
         self.assertIsNone(decision)
 
     def test_unjudgeable_samples_do_not_count(self):

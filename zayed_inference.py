@@ -631,12 +631,20 @@ def process_result(result, metadata, source_frame):
     person_boxes = [t.bbox for t in motion_tracks if t.group == tracking.PERSON_GROUP]
     carried_tracks = [t for t in object_tracks if t.class_id in abandoned.CANDIDATE_CLASS_IDS]
     for obj_track, abandon_meta in abandoned_detector.update(camera_id, carried_tracks, person_boxes,
-                                                             frame_width, frame_height):
+                                                             frame_width, frame_height, now=observed_at):
         if event_pipeline.handle_abandoned_event(obj_track, abandon_meta, frame_width=frame_width,
                                                  frame_height=frame_height, observed_at=observed_at,
                                                  frame=source_frame) == "sent":
-            log(f"[UNATTENDED] {camera_id} {obj_track.class_name} track={obj_track.track_id} "
+            log(f"[UNATTENDED] {camera_id} {abandon_meta['object_type']} episode={abandon_meta['episode_id']} "
+                f"track={obj_track.track_id} tracks={len(abandon_meta['track_ids'])} "
                 f"dwell={abandon_meta['dwell_seconds']}s")
+    # ZAYED: an alerted episode that has ended (removed / moved / attended) closes its alarm.
+    for episode_object, resolve_meta in abandoned_detector.drain_resolutions(camera_id):
+        if event_pipeline.handle_abandoned_resolution(episode_object, resolve_meta, frame_width=frame_width,
+                                                      frame_height=frame_height, observed_at=observed_at) == "sent":
+            log(f"[UNATTENDED-RESOLVED] {camera_id} episode={resolve_meta['episode_id']} "
+                f"{resolve_meta['resolution']} after {resolve_meta['duration_seconds']}s "
+                f"tracks={','.join(resolve_meta['track_ids'])}")
 
     for obj_track, object_meta, crop_box in object_logger_instance.observe(camera_id, object_tracks, frame_width,
                                                                           frame_height, observed_at):
@@ -652,7 +660,7 @@ def process_result(result, metadata, source_frame):
                                            scope=crowd_metadata.get("zone_id"))
 
     people_counter_instance.observe(camera_id, tracked_objects, frame_width, frame_height)
-    occupancy_instance.observe(camera_id, tracked_objects, observed_at)
+    occupancy_instance.observe(camera_id, tracked_objects, observed_at, frame_width, frame_height)
 
     persons = [t for t in tracked_objects if t.group == tracking.PERSON_GROUP]
     floor_mapper.observe(camera_id, persons, observed_at)

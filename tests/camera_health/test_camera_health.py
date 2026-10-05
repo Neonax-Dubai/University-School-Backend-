@@ -13,6 +13,13 @@ from camera_health.manager import (UMBRELLA_EVENT_TYPE,
                                    FEATURE_TAMPER, CAMERA_HEALTH_FEATURES)
 from camera_health.state import CameraState
 
+# Signal-loss timings are derived from the configured threshold, never written as literals.
+# The threshold is a deployment decision - 5 s in the Dubai baseline, 120 s at Zayed, where a
+# brief stream drop on an inference restart must not become a critical alarm - and these tests
+# pin the CONTRACT: a gap longer than the threshold is an outage, a shorter one is not.
+GAP = D.SIGNAL_LOSS_SECONDS
+OUTAGE = 1000.0 + GAP + 1.0          # first sample that is unambiguously an outage
+
 RNG = np.random.default_rng(7)
 
 
@@ -107,17 +114,17 @@ class SignalLossTests(unittest.TestCase):
         m = manager(features=[FEATURE_SIGNAL_LOSS])
         r = FakeReader(100)
         m.note_streams({"CAM-A": r}, now=1000.0)
-        m.note_streams({"CAM-A": r}, now=1003.9)      # 3.9s < 5.0s threshold
+        m.note_streams({"CAM-A": r}, now=1000.0 + GAP * 0.78)   # still inside the threshold
         self.assertEqual(m.transitions, 0)
         r.frames_read += 30
-        m.note_streams({"CAM-A": r}, now=1004.5)
+        m.note_streams({"CAM-A": r}, now=1000.0 + GAP * 0.9)
         self.assertEqual(m.transitions, 0)
 
     def test_sustained_gap_raises_once(self):
         m = manager(features=[FEATURE_SIGNAL_LOSS])
         r = FakeReader(100)
         m.note_streams({"CAM-A": r}, now=1000.0)
-        for t in (1006.0, 1007.0, 1010.0, 1030.0, 1060.0):
+        for t in (OUTAGE, OUTAGE + 1, OUTAGE + 4, OUTAGE + 24, OUTAGE + 54):
             m.note_streams({"CAM-A": r}, now=t)
         st = m._states["CAM-A"]
         self.assertTrue(st.signal.active)
@@ -127,11 +134,11 @@ class SignalLossTests(unittest.TestCase):
         m = manager(features=[FEATURE_SIGNAL_LOSS])
         r = FakeReader(100)
         m.note_streams({"CAM-A": r}, now=1000.0)
-        m.note_streams({"CAM-A": r}, now=1006.0)
+        m.note_streams({"CAM-A": r}, now=OUTAGE)
         st = m._states["CAM-A"]
         self.assertTrue(st.signal.active)
         r.frames_read += 10
-        m.note_streams({"CAM-A": r}, now=1007.0)
+        m.note_streams({"CAM-A": r}, now=OUTAGE + 1)
         self.assertFalse(st.signal.active)
         self.assertEqual(st.signal.recoveries, 1)
 
@@ -140,17 +147,19 @@ class SignalLossTests(unittest.TestCase):
         r = FakeReader(100)
         m.note_streams({"CAM-A": r}, now=1000.0)
         for i in range(200):
-            m.note_streams({"CAM-A": r}, now=1006.0 + i)
+            m.note_streams({"CAM-A": r}, now=OUTAGE + i)
         self.assertEqual(m._states["CAM-A"].signal.raises, 1)
 
     def test_cooldown_blocks_immediate_reraise(self):
         m = manager(features=[FEATURE_SIGNAL_LOSS])
         r = FakeReader(100)
         m.note_streams({"CAM-A": r}, now=1000.0)
-        m.note_streams({"CAM-A": r}, now=1006.0)       # raise 1
+        m.note_streams({"CAM-A": r}, now=OUTAGE)       # raise 1
         r.frames_read += 5
-        m.note_streams({"CAM-A": r}, now=1007.0)       # recover
-        m.note_streams({"CAM-A": r}, now=1013.0)       # gap again, inside cooldown
+        m.note_streams({"CAM-A": r}, now=OUTAGE + 1)              # recover
+        # A second outage: the gap is measured from the recovery, so it must again exceed
+        # the threshold to be a candidate at all, while staying inside the 300 s cooldown.
+        m.note_streams({"CAM-A": r}, now=OUTAGE + 1 + GAP + 1)     # gap again, inside cooldown
         self.assertEqual(m._states["CAM-A"].signal.raises, 1)
 
     def test_feature_off_means_no_signal_tracking(self):
@@ -451,7 +460,7 @@ class MultiCameraTests(unittest.TestCase):
         a, b = FakeReader(10), FakeReader(10)
         m.note_streams({"CAM-A": a, "CAM-B": b}, now=1000.0)
         b.frames_read += 30
-        m.note_streams({"CAM-A": a, "CAM-B": b}, now=1006.0)
+        m.note_streams({"CAM-A": a, "CAM-B": b}, now=OUTAGE)
         self.assertTrue(m._states["CAM-A"].signal.active)
         self.assertFalse(m._states["CAM-B"].signal.active)
 

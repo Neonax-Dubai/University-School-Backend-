@@ -54,7 +54,9 @@ ZAYED_EVENT_TYPES = {
     "violence_detected": "FIGHT_DETECTED",
     "fall_detected": "FALL_DETECTED",
     "abandoned_object": "UNATTENDED_OBJECT_DETECTED",
-    "crowd_detected": "OVERCROWDING_DETECTED",
+    # crowd_detected is NOT mapped: it is a per-camera, per-zone person threshold, not the classroom
+    # against its capacity. Mapped, one crowd raised up to one "Classroom Over Capacity" alarm per
+    # camera. OVERCROWDING_DETECTED comes only from occupancy.py; zone crowds stay crowd_detected.
     "camera_tamper": "CAMERA_TAMPERING_DETECTED",
 }
 
@@ -794,9 +796,38 @@ class EventPipeline:
         Emit an abandoned_object event for an unattended bag/box.
 
         Like zone events this raises an Alarm in the dashboard, so it is logged,
-        debounced hard, and carries an evidence crop. abandoned.py already fires
-        once per resting spot; this cooldown is a backstop against a track that
-        flickers in and out.
+        debounced hard, and carries an evidence crop. abandoned.py fires once per
+        physical EPISODE (metadata["episode_id"]); the cooldown is a backstop
+        scoped to that episode, not to the track id - a fragmented object hands
+        this a new track id for the same episode.
+        """
+        # ZAYED: the backstop is keyed by the episode, never the track id.
+        episode_id = (metadata or {}).get("episode_id")
+        if episode_id and not self.debouncer.allow(tracked.camera_id, "", "abandoned_object", episode_id,
+                                                   ZONE_COOLDOWN_SECONDS):
+            self.suppressed += 1
+            return "suppressed"
+        return self._emit(
+            tracked,
+            "abandoned_object",
+            frame_width=frame_width,
+            frame_height=frame_height,
+            observed_at=observed_at,
+            extra_metadata=metadata,
+            scope=(metadata or {}).get("episode_id"),
+            cooldown=ZONE_COOLDOWN_SECONDS,
+            notable=True,
+            frame=frame,
+            want_evidence="abandoned_object" in evidence.ALARM_EVIDENCE_TYPES,
+        )
+
+    def handle_abandoned_resolution(self, tracked, metadata, frame_width, frame_height, observed_at):
+        """
+        ZAYED: report that an alerted unattended-object episode is over - removed, moved or
+        attended. Same event type as the alert, linked by metadata["episode_id"] and marked
+        metadata["recovered"] = True (the camera-tampering incident pattern), so the dashboard
+        closes exactly that episode's alarm and raises nothing. No crop: the object is usually
+        no longer in view, and the alert already carries the episode's evidence.
         """
         return self._emit(
             tracked,
@@ -805,10 +836,9 @@ class EventPipeline:
             frame_height=frame_height,
             observed_at=observed_at,
             extra_metadata=metadata,
+            scope=f"{(metadata or {}).get('episode_id')}:resolved",
             cooldown=ZONE_COOLDOWN_SECONDS,
             notable=True,
-            frame=frame,
-            want_evidence="abandoned_object" in evidence.ALARM_EVIDENCE_TYPES,
         )
 
     def handle_object_event(

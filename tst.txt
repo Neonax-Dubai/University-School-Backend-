@@ -1,0 +1,25 @@
+2592×1944 - ai inference
+
+2.48pm - fire
+16:19
+mobile phone in hand only alert
+14:45 cam 2
+16:16 - camera 2 tampering
+
+Fall false positive — highest immediate reliability problem.
+Evacuation / stranded person — concrete production gap.
+Faculty/invigilator absence — currently missing the core absence scenario.
+Occupancy/overcrowding — calibration and counting logic.
+Student/faculty recognition — enrollment/threshold/real C101 validation.
+Unattended objects — broaden objects + configurable rules.
+Camera tampering — enable and validate.
+Distraction/sleeping — validate sleeping and refine phone behavior.
+Heat map — calibration + floor-plan representation.
+Fighting — staged validation/tuning.
+Centralized dashboard — merge/deploy remaining Zayed functionality and reports.
+
+
+Fall, fight, sleeping — real negatives
+Fall: torso angle median 8.4°, max 21.7°, against 65°. 16 of 17 keypoints — visibility was fine. Over 41 s the torso never came within 43° of the threshold.
+Fight: both people tracked and posed in 352/352 frames, 130 pairs evaluated, zero strikes measured on either side.
+Sleeping: 0 of 49 head-down samples; head-rise median 0.70 against a <0.25 requirement.

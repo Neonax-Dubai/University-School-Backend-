@@ -46,7 +46,6 @@ services:
       POSE_ADAPTER_MODEL: /engines/zayed/current/yolo26m-pose.engine
       POSE_ADAPTER_MODEL_PT: /engines/zayed/current/yolo26m-pose.engine
       TORCH_HOME: /models/zayed/torch
-      # Face identification (InsightFace buffalo_l under $HOME/.insightface) - GPU only
       FACE_ID_REQUIRE_GPU: "1"
       FACE_ID_QDRANT_HOST: qdrant
       FACE_ID_QDRANT_PORT: "6333"

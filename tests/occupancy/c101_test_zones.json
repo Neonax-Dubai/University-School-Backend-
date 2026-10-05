@@ -1,0 +1,10 @@
+{
+  "_comment": "TEST ownership zones for the offline replay, drawn on the 2026-09-26 C101 recording frames - NOT the operator's production zones (pass those with --zones). Split on the aisle between the second and third desk columns: camera_01 owns the single-desk column and the column beside it, camera_02 the other two. camera_03 (faculty view) has none.",
+  "camera_01": [{"name": "TEST camera_01 ownership (left side)",
+                 "coordinates": [[0.0, 0.0], [0.70, 0.0], [0.72, 0.10], [0.86, 0.37], [0.96, 0.52], [1.0, 0.58], [1.0, 1.0], [0.0, 1.0]],
+                 "rules": {"occupancy": true, "overcrowding": true}}],
+  "camera_02": [{"name": "TEST camera_02 ownership (right side)",
+                 "coordinates": [[0.36, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.70], [0.09, 0.57], [0.18, 0.45], [0.25, 0.36], [0.345, 0.10]],
+                 "rules": {"occupancy": true, "overcrowding": true}}],
+  "camera_03": []
+}

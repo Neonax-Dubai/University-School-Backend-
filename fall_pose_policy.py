@@ -44,6 +44,27 @@ dependent - an overhead camera projects a horizontal body onto a near-vertical
 axis. That is a known limitation, not an oversight.
 
 Changing this definition invalidates the offline validation.
+
+ZAYED 2026-09-29 - LOWER-BODY EVIDENCE (docs/ZAYED_FALL_REMEDIATION.md)
+------------------------------------------------------------------------
+Event 32 (camera_01, 2026-09-28 07:15:14 Dubai) raised a critical "Person Fell"
+for a person bending over a desk. Replayed offline from the NVR footage it
+reproduces exactly: torso 66-67 deg, box 1.05 wide-to-tall, knees visible,
+ANKLES hidden by the desk. Without ankles there is no trunk axis, and then
+neither rule looked below the hips: `horizontal` fell back to the torso alone,
+and `ground` never consulted the lower body at all - it trusted the box shape,
+and a desk that cuts off the legs turns any bend into a wide box.
+
+Three changes, each measured on that footage:
+  * the body below the hips must be down too: the ankle->shoulder axis when the
+    ankles are visible (which `horizontal` already used and `ground` now uses
+    too), else the KNEE->shoulder axis. The bend's
+    knee axis stayed at 22-28 deg; a person lying down reads 70-90;
+  * with no knee and no ankle visible, the hips AND the shoulders must have come
+    down towards the floor, in the person's own upright torso lengths from their
+    last upright observation. The bend's hips moved -0.07..+0.03 of one;
+  * the down state must be held CONFIRM_SECONDS = 1.0 s (was 0.3 s).
+The transition requirement (clearly upright shortly before) is unchanged.
 """
 
 import math
@@ -116,9 +137,43 @@ UPRIGHT_WINDOW_SECONDS = _float_env("FALL_POSE_UPRIGHT_WINDOW", 3.0)
 #: on the ground and stay there for seconds. A wider-than-tall box is what
 #: makes that state safe to accept - the bending cases that the trunk gate
 #: was built for have upright-shaped boxes (aspect ratio 0.77 and below).
+#:
+#: ZAYED: not in a classroom. The box is the TRACK's box, and a desk that hides
+#: the lower legs cuts it off at the knees, so a bend over the desk is wider than
+#: tall (Event 32: 1.045, replay 1.04-1.07). The ground state now also needs the
+#: body below the hips to be down - see lower_body_is_down().
 GROUND_TORSO_DEG = _float_env("FALL_POSE_GROUND_TORSO_DEG", 65.0)
 GROUND_AR = _float_env("FALL_POSE_GROUND_AR", 1.0)
-CONFIRM_SECONDS = _float_env("FALL_POSE_CONFIRM_SECONDS", 0.3)
+
+#: ZAYED: 1.0 s, was 0.3 s. On the Event 32 footage the old rule's down state
+#: ran 0.9, 1.3 and 1.2 s in the three frame-sampling phases, so time alone could
+#: not have separated that bend - the lower-body evidence does. What the longer
+#: hold buys is margin against transients (a mis-associated pose, a tracker
+#: swap), which 0.3 s - three pose samples at the live 10 fps - does not have.
+#: 1.0 s is ten consecutive samples, and it stays inside the adapter's 2 s
+#: CANDIDATE_HOLD_SECONDS, so a person whose box briefly narrows while lying can
+#: still complete it. Longer is not free: any single non-down sample restarts the
+#: hold, and the same footage shows a one-sample dip inside a sustained posture.
+CONFIRM_SECONDS = _float_env("FALL_POSE_CONFIRM_SECONDS", 1.0)
+
+#: ZAYED: with NO knee and NO ankle visible there is no lower-body axis, and the
+#: torso plus a (desk-truncated) box is not evidence of lying down. Then both
+#: landmarks must have come down towards the floor, measured in the person's own
+#: torso length at their last upright observation, from their position there:
+#:
+#:     hips       >= HIP_DROP_MIN_RATIO       standing ~0.9 m, a torso ~0.5 m; lying on
+#:                                            the floor they drop ~1.6 torsos
+#:     shoulders  >= SHOULDER_DROP_MIN_RATIO  ~1.4 m -> ~0.2 m lying, ~2.4 torsos
+#:
+#: Each rules out a different look-alike. The hips rule out a bend: Event 32's
+#: moved -0.07..+0.03 torsos while its shoulders came down. The shoulders rule out
+#: everything that lowers the hips but keeps the upper body up: sitting down and
+#: slumping onto the desk (shoulders ~0.8 m, ~1.2 torsos), kneeling (~1.6), a deep
+#: squat leaning forward 70 deg (~0.5 m, ~1.8) - which is why this is 2.0, not
+#: lower. Measured in IMAGE space like every other quantity here, so a fall
+#: straight away from the camera shows less drop than one across its view.
+HIP_DROP_MIN_RATIO = _float_env("FALL_POSE_HIP_DROP_RATIO", 1.0)
+SHOULDER_DROP_MIN_RATIO = _float_env("FALL_POSE_SHOULDER_DROP_RATIO", 2.0)
 MIN_CONFIDENT_KPTS = _int_env("FALL_POSE_MIN_KPTS", 8)
 KPT_CONF = _float_env("FALL_POSE_KPT_CONF", 0.30)
 
@@ -215,6 +270,9 @@ def pose_measurements(kpts, confs, bbox):
         "confident_keypoints": int(sum(1 for c in confs if c >= KPT_CONF)),
         "torso_angle": angle_from_vertical(hip, shoulder),
         "trunk_angle": angle_from_vertical(ankle, shoulder),
+        # ZAYED: the knee -> shoulder axis - the lower-body evidence when a desk
+        # hides the ankles (see lower_body_is_down).
+        "knee_axis_angle": angle_from_vertical(knee, shoulder),
         "shoulder_angle": seg_tilt(L_SHOULDER, R_SHOULDER),
         "hip_angle": seg_tilt(L_HIP, R_HIP),
         "knee_angle_min": (min(knees) if knees else None),
@@ -226,6 +284,68 @@ def pose_measurements(kpts, confs, bbox):
         "body_height": height,
         "body_aspect_ratio": width / height,
     }
+
+
+def lower_body_evidence(m, upright):
+    """ZAYED. What the body below the hips says, and how far the hips and the
+    shoulders have come down since this person was last upright.
+
+    m        pose_measurements() of this observation
+    upright  (hip_y, shoulder_y, torso_length) at the last upright observation,
+             or None when there has been none
+    """
+    if m.get("trunk_angle") is not None:
+        source, angle = "ankle", m["trunk_angle"]
+    elif m.get("knee_axis_angle") is not None:
+        source, angle = "knee", m["knee_axis_angle"]
+    else:
+        source, angle = None, None
+    hip_drop = shoulder_drop = None
+    hip, shoulder = m.get("hip_center"), m.get("shoulder_center")
+    if upright is not None and hip is not None and shoulder is not None:
+        up_hip_y, up_shoulder_y, torso_length = upright
+        if torso_length > 1e-6:
+            # Image y grows downwards, so a positive drop is towards the floor.
+            hip_drop = (hip[1] - up_hip_y) / torso_length
+            shoulder_drop = (shoulder[1] - up_shoulder_y) / torso_length
+    return {"lower_body_source": source, "lower_body_angle": angle,
+            "hip_drop_ratio": hip_drop, "shoulder_drop_ratio": shoulder_drop}
+
+
+def lower_body_is_down(evidence, min_axis_deg):
+    """ZAYED. Is the body below the hips down as well as the torso?
+
+    With an ankle or knee axis, that axis must be at least `min_axis_deg` from
+    vertical - the same horizontality the rule asks of the torso. With neither,
+    the hips and the shoulders must both have come down (HIP_DROP_MIN_RATIO,
+    SHOULDER_DROP_MIN_RATIO). No upright reference means no evidence: no.
+    """
+    if evidence["lower_body_source"] is not None:
+        return evidence["lower_body_angle"] >= min_axis_deg
+    hip_drop, shoulder_drop = evidence["hip_drop_ratio"], evidence["shoulder_drop_ratio"]
+    return (hip_drop is not None and shoulder_drop is not None
+            and hip_drop >= HIP_DROP_MIN_RATIO and shoulder_drop >= SHOULDER_DROP_MIN_RATIO)
+
+
+def _not_down_reason(torso, trunk, aspect, evidence):
+    """ZAYED. Why this observation is not a down state, in an operator's words."""
+    if torso < GROUND_TORSO_DEG and not (trunk is not None and trunk >= TRUNK_FALL_DEG):
+        return f"torso {torso:.1f} deg < {GROUND_TORSO_DEG} deg"
+    source = evidence["lower_body_source"]
+    if source is not None:
+        angle = evidence["lower_body_angle"]
+        if angle < GROUND_TORSO_DEG:
+            return (f"torso {torso:.1f} deg, but the {source}->shoulder axis is {angle:.1f} deg: "
+                    f"the body below the hips is upright - bent or seated, not lying")
+        return (f"torso {torso:.1f} deg, {source}->shoulder axis {angle:.1f} deg, but the box is "
+                f"not wider than tall ({aspect:.2f} < {GROUND_AR}) - bent or seated, not fallen")
+    hip_drop, shoulder_drop = evidence["hip_drop_ratio"], evidence["shoulder_drop_ratio"]
+    if hip_drop is None:
+        return (f"torso {torso:.1f} deg with no knee or ankle visible and no upright reference - "
+                f"no evidence of lying down")
+    return (f"torso {torso:.1f} deg with no knee or ankle visible; hips dropped {hip_drop:+.2f} and "
+            f"shoulders {shoulder_drop:+.2f} upright torso lengths (need {HIP_DROP_MIN_RATIO} and "
+            f"{SHOULDER_DROP_MIN_RATIO}) - leaning over, not on the floor")
 
 
 class FallPoseEvent:
@@ -280,6 +400,20 @@ class FallPoseEvent:
             "trunk_angle": (None if m.get("trunk_angle") is None
                             else round(m["trunk_angle"], 2)),
             "aspect_ratio": round(m.get("body_aspect_ratio", 0.0), 3),
+            # ZAYED: the lower-body evidence the decision rested on.
+            "down_rule": m.get("down_rule"),
+            "lower_body_evidence": m.get("lower_body_source") or "none",
+            "lower_body_axis_angle": (None if m.get("lower_body_angle") is None
+                                      else round(m["lower_body_angle"], 2)),
+            "knee_axis_angle": (None if m.get("knee_axis_angle") is None
+                                else round(m["knee_axis_angle"], 2)),
+            "hip_drop_ratio": (None if m.get("hip_drop_ratio") is None
+                               else round(m["hip_drop_ratio"], 3)),
+            "shoulder_drop_ratio": (None if m.get("shoulder_drop_ratio") is None
+                                    else round(m["shoulder_drop_ratio"], 3)),
+            "hip_drop_threshold": HIP_DROP_MIN_RATIO,
+            "shoulder_drop_threshold": SHOULDER_DROP_MIN_RATIO,
+            "policy_revision": "zayed-lower-body-2026-09-29",
         }
 
     def scope(self):
@@ -306,7 +440,7 @@ class _Result:
 
 class _TrackState:
     __slots__ = ("state", "since", "last_seen", "cooldown_until",
-                 "event_sent", "uncertain_count", "last_upright")
+                 "event_sent", "uncertain_count", "last_upright", "upright_ref")
 
     def __init__(self):
         self.state = NORMAL
@@ -318,6 +452,9 @@ class _TrackState:
         #: last moment this track was seen clearly upright - the transition
         #: evidence a fall needs and a reclined chair never has.
         self.last_upright = None
+        #: ZAYED: (hip_y, shoulder_y, torso_length) at that moment - the person's
+        #: own upright geometry, which lower_body_evidence() measures drops from.
+        self.upright_ref = None
 
 
 class FallPosePolicy:
@@ -380,34 +517,41 @@ class FallPosePolicy:
                 and (trunk is None or trunk <= UPRIGHT_ANGLE_DEG)
                 and aspect is not None and aspect <= UPRIGHT_AR):
             st.last_upright = now
+            # ZAYED: and WHERE this person's hips and shoulders were, so a later
+            # observation can say how far they have come down since.
+            hip, shoulder = m["hip_center"], m["shoulder_center"]
+            st.upright_ref = (hip[1], shoulder[1],
+                              math.hypot(shoulder[0] - hip[0], shoulder[1] - hip[1]))
 
         # Two ways to be "down". Both still need the transition evidence below.
         #
-        #   horizontal : the original gate, unchanged - a horizontal torso AND
-        #                a horizontal full-body axis when that axis exists.
-        #                This is the trunk fix and it is preserved exactly.
-        #   ground     : a lower torso angle, but only in a wider-than-tall
-        #                body box. That is a person lying on the floor whose
-        #                torso is propped up - real, and invisible to the gate
-        #                above. A bend keeps an upright-shaped box, so it
-        #                cannot reach this branch.
+        #   horizontal : a horizontal torso AND a horizontal body below the hips.
+        #   ground     : a lower torso angle, but only in a wider-than-tall box -
+        #                a person lying on the floor whose torso is propped up.
+        #
+        # ZAYED: both now also need lower_body_is_down(). Dubai let `horizontal`
+        # fall back to the torso alone when the ankles were hidden, and `ground`
+        # never looked below the hips, trusting the box shape - which a desk
+        # hiding the legs defeats (Event 32). The ankle axis is still the first
+        # choice: with the legs visible `horizontal` is unchanged, while `ground`
+        # now also needs that axis at 65 deg, so a reach to the floor with the
+        # arms out (a wide box over upright legs) no longer passes either.
+        evidence = lower_body_evidence(m, st.upright_ref)
+        m.update(evidence)
         horizontal = (torso >= TORSO_FALL_DEG
-                      and (trunk is None or trunk >= TRUNK_FALL_DEG))
+                      and lower_body_is_down(evidence, TRUNK_FALL_DEG))
         ground = ((torso >= GROUND_TORSO_DEG
                    or (trunk is not None and trunk >= TRUNK_FALL_DEG))
-                  and aspect is not None and aspect >= GROUND_AR)
+                  and aspect is not None and aspect >= GROUND_AR
+                  and lower_body_is_down(evidence, GROUND_TORSO_DEG))
 
         if not (horizontal or ground):
             st.since = None
             st.state = POSE_CANDIDATE
             st.event_sent = False
-            if torso < TORSO_FALL_DEG:
-                why = f"torso {torso:.1f} deg < {TORSO_FALL_DEG} deg"
-            else:
-                why = (f"torso {torso:.1f} deg but full-body trunk axis "
-                       f"{trunk:.1f} deg < {TRUNK_FALL_DEG} deg and body box "
-                       f"is not wider than tall - bent or seated, not fallen")
-            return _Result(POSE_CANDIDATE, None, why, m)
+            return _Result(POSE_CANDIDATE, None,
+                           _not_down_reason(torso, trunk, aspect, evidence), m)
+        m["down_rule"] = "horizontal" if horizontal else "ground"
 
         # §12 temporal confirmation on measured timestamps, never on a frame
         # count - the cameras run at 15, 25 and 30 fps and the interval varies.
@@ -449,8 +593,9 @@ class FallPosePolicy:
                           pose_track_iou, self.model_name, self.imgsz,
                           frame_width, frame_height,
                           seconds_since_upright=(st.since - st.last_upright)),
-            f"torso {torso:.1f} deg >= {TORSO_FALL_DEG} deg sustained {held:.2f}s "
-            f"with {m['confident_keypoints']} confident keypoints", m)
+            f"{m['down_rule']}: torso {torso:.1f} deg sustained {held:.2f}s "
+            f"with {m['confident_keypoints']} confident keypoints, lower body "
+            f"{m.get('lower_body_source') or 'hidden'}", m)
 
     # -------------------------------------------------------------- upkeep
     def prune(self, now=None):

@@ -122,7 +122,7 @@ IOU_THRESH = float(os.getenv("TRACK_IOU_THRESH", "0.35"))
 # watch the HUD's "churn" figure in test_detect.py while nudging it. If you
 # point a script at a lower-resolution source (a substream, a different
 # camera), scale this back down proportionally.
-DIST_THRESH = float(os.getenv("TRACK_DIST_THRESH", "150"))
+DIST_THRESH = float(os.getenv("TRACK_DIST_THRESH", "250"))
 
 # Consecutive UNMATCHED inference frames after which a re-match is treated as a
 # DIFFERENT physical object, and the exported label is retired in favour of a

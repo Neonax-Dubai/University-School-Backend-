@@ -138,11 +138,13 @@ class RoutingTests(unittest.TestCase):
     def test_04_signal_loss_is_not_camera_tampering(self):
         h = Harness()
         reader = FakeReader(100)
-        for t in range(30):
+        # Long enough to exceed the configured signal-loss threshold, whatever it is set to.
+        from camera_health import detectors as _D
+        for t in range(int(_D.SIGNAL_LOSS_SECONDS) + 10):
             h.m.note_streams({CAM: reader}, now=float(t))          # counter stuck
         self.assertTrue(h.m._states[CAM].signal.active, "signal loss is still detected")
         reader.frames_read = 200
-        h.m.note_streams({CAM: reader}, now=31.0)
+        h.m.note_streams({CAM: reader}, now=float(int(_D.SIGNAL_LOSS_SECONDS) + 11))
         self.assertFalse(h.m._states[CAM].signal.active)
         self.assertEqual(h.sent, [])
 

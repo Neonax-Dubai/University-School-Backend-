@@ -7,9 +7,15 @@ or None for "no decision possible". Persistence, cooldown and the one-raise /
 one-recovery rule belong to state.Condition, never to a detector.
 
 Thresholds are the approved Dubai values (asserted by the acceptance tests):
-SIGNAL_LOSS_SECONDS 5.0, OBSTRUCTION_EDGE_MAX 0.15, DEFOCUS_RATIO 0.50,
-TAMPER_DISTANCE 0.65, tamper persistence 8 s (validated on real CAM-R25
-replays: 5 s fired on people walking, 8 s did not, genuine covers still did).
+OBSTRUCTION_EDGE_MAX 0.15, DEFOCUS_RATIO 0.50, TAMPER_DISTANCE 0.65, tamper
+persistence 8 s (validated on real CAM-R25 replays: 5 s fired on people walking,
+8 s did not, genuine covers still did).
+
+Two deliberately differ from that baseline at Zayed (2026-10-05):
+SIGNAL_LOSS_SECONDS 120.0 (was 5.0) and the new TAMPER_STRUCTURE_INTACT_MIN.
+Both are below, with the measurements that set them. The signal-loss tests derive
+their timings from the constant rather than pinning 5 s, so the contract they
+assert - a gap longer than the threshold is an outage - holds at either value.
 """
 
 import os
@@ -28,7 +34,13 @@ def _env_float(name, default):
 
 
 # ------------------------------------------------------------ signal loss
-SIGNAL_LOSS_SECONDS = 5.0
+# ZAYED 2026-10-05. Was a hard-coded 5.0 with no way to tune it. Every restart of the
+# inference service, every relay blip and every replay run dropped all three streams for a
+# few seconds, and each one became a CRITICAL "Camera Signal Lost" alarm on all three
+# cameras at once - 83 of them in the stored history. Here an operator cares that a camera
+# is really gone, not that a frame was late, so the default is two minutes and the env var
+# still allows a site to choose otherwise.
+SIGNAL_LOSS_SECONDS = _env_float("CAMERA_HEALTH_SIGNAL_LOSS_SECONDS", 120.0)
 SIGNAL_LOSS_COOLDOWN_SECONDS = _env_float("CAMERA_HEALTH_SIGNAL_LOSS_COOLDOWN_SECONDS", 300.0)
 
 # ------------------------------------------------------------ obstruction
@@ -67,6 +79,14 @@ SCENE_REBASELINE_AFTER_SECONDS = 900.0
 
 # ------------------------------------------------------------ lighting guard
 STRUCTURAL_OVERLAP_LIGHTING_MIN = _env_float("CAMERA_HEALTH_STRUCTURAL_OVERLAP_LIGHTING_MIN", 0.80)
+
+# ZAYED 2026-10-05. Camera Tampering means the view was REPLACED, so a sample whose structure
+# still overlaps the baseline this much is not interference whatever moved the signature.
+# Calibrated on this site's own footage, not inherited: the real lens cover of 2026-09-30
+# 16:16:56-16:17:12 on camera_01 measured overlap 0.105-0.597 across six of its nine samples,
+# while every false raise in the stored history sat at 0.665-0.925. 0.65 separates them and
+# still confirms that cover (see tests/camera_health/test_camera_tamper_structure_gate.py).
+TAMPER_STRUCTURE_INTACT_MIN = _env_float("CAMERA_HEALTH_TAMPER_STRUCTURE_INTACT_MIN", 0.65)
 LIGHTING_MIN_BRIGHTNESS_RATIO = _env_float("CAMERA_HEALTH_LIGHTING_MIN_BRIGHTNESS_RATIO", 1.3)
 
 
@@ -198,6 +218,40 @@ def tamper_state(state, gray, now, obstructed):
             detail["illumination_transition"] = True
             return False, detail
         detail["lighting_check"] = check
+
+        # ZAYED. Camera Tampering means the view was REPLACED. structural_overlap is the
+        # share of the baseline's strong edges still present, and this module's own
+        # calibration puts a genuine cover at 0.10-0.17 (lights on/off 0.86-0.87). So an
+        # overlap at or above the lighting minimum says the baseline structure is still
+        # there: whatever moved the signature past TAMPER_DISTANCE, nothing covered the lens.
+        #
+        # The lighting guard above could not excuse these because it also demands a
+        # brightness move of LIGHTING_MIN_BRIGHTNESS_RATIO, and the observed false raises
+        # had brightness essentially unchanged (ratio 1.00-1.23) with structure 0.80-0.93
+        # intact - a scene that drifted, a replayed clip, a baseline learned on a transient
+        # frame at stream start. None of them is interference, and each one cost an operator
+        # a critical alarm.
+        overlap = check.get("structural_overlap")
+        if overlap is not None and overlap >= TAMPER_STRUCTURE_INTACT_MIN:
+            state.structure_intact_rejects += 1
+            detail["structure_intact"] = True
+            if state.structure_intact_since is None:
+                state.structure_intact_since = now
+            # NONE, not False. Condition.update(bad=False) clears `since`, and a real cover
+            # contains transitional frames whose structure still overlaps (measured on the
+            # 2026-09-30 16:17 cover: overlap 0.94 at two samples inside a 0.10-0.23 episode).
+            # Returning False there resets the 8 s candidate mid-cover and left the genuine
+            # raise on zero margin. The manager skips the condition entirely on None, so the
+            # candidate survives the gap and the cover still confirms - two seconds sooner.
+            #
+            # A candidate that has outlived the persistence window while the structure stayed
+            # intact is protecting nothing, so it is dropped: otherwise a later unrelated
+            # sample could inherit its age and raise without serving its own 8 s.
+            if (not state.tamper.active and state.tamper.since is not None
+                    and now - state.structure_intact_since >= TAMPER_SECONDS):
+                state.tamper.since = None
+            return None, detail
+        state.structure_intact_since = None
     elif (not bad and not state.tamper.active and state.tamper.since is None
           and d < SCENE_ADAPT_DISTANCE):
         adapted = (1.0 - SCENE_ADAPT_ALPHA) * state.scene_baseline + SCENE_ADAPT_ALPHA * sig

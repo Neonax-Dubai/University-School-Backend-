@@ -132,6 +132,9 @@ class CameraState:
         self.scene_rejected = 0
         self.scene_rebuilds = 0
         self.illumination_resets = 0
+        # ZAYED: raises refused because the baseline structure was still present
+        self.structure_intact_rejects = 0
+        self.structure_intact_since = None
 
     def scene_baseline_valid(self):
         return self.scene_baseline is not None and self.scene_phase == PHASE_READY

@@ -1,7 +1,7 @@
 """
 Abandoned (unattended) object detection - one alert per PHYSICAL unattended episode.  [RFP 6.1]
 
-An object of an enabled class (backpack / handbag / suitcase) is UNATTENDED when it has stayed
+An object of an enabled class (backpack / handbag / suitcase / laptop / cell phone) is UNATTENDED when it has stayed
 STATIONARY with NO PERSON NEARBY continuously for longer than a dwell threshold. One physical
 object left in one place is one EPISODE, and one episode raises exactly ONE alert, however many
 tracker ids the object passes through while it lies there.
@@ -96,10 +96,11 @@ docs/ZAYED_UNATTENDED_OBJECT.md):
                                    fraction of the larger box diagonal              (default 0.75)
   ABANDON_ASSOCIATION_SIZE_RATIO   max box-area ratio for that                        (default 4.0)
   ABANDON_ASSOCIATION_STRICT_CLASS 1 = only the same class continues an episode       (default 0:
-                                   the detector reports one bag as backpack AND handbag)
-  ABANDON_CLASSES                  unattended classes, names or COCO ids, e.g. "backpack,handbag";
+                                   the same CLASS GROUP - the detector reports one bag as
+                                   backpack AND handbag; a laptop or a phone is its own group)
+  ABANDON_CLASSES                  unattended classes, names or COCO ids, e.g. "backpack,laptop";
                                    only SUPPORTED_CLASSES are accepted (ABANDON_CLASS_IDS is the old
-                                   name)                                  (default backpack,handbag,suitcase)
+                                   name)        (default backpack,handbag,suitcase,laptop,cell phone)
   ABANDON_MIN_OBSERVED_FRACTION    share of the dwell the object must actually be DETECTED (0.3)
   ABANDON_OBJECT_CONFIDENCE        detector confidence a candidate bag needs (default 0.25)
 """
@@ -140,12 +141,36 @@ ASSOCIATION_STRICT_CLASS = os.getenv("ABANDON_ASSOCIATION_STRICT_CLASS", "0") ==
 SPOT_MEMORY_SECONDS = RECOVERY_WINDOW_SECONDS
 
 # ---- classes -----------------------------------------------------------------------------------
-#: The classes this use case supports: carried objects the COCO detector reports and the use case
-#: has been validated for. "luggage" is COCO "suitcase". COCO has NO box / package class, so the
-#: deployed detector cannot report one and it cannot be enabled here - that needs a custom model.
-SUPPORTED_CLASSES = {24: "backpack", 26: "handbag", 28: "suitcase"}
-CLASS_ALIASES = {"backpack": 24, "handbag": 26, "suitcase": 28, "luggage": 28}
-DEFAULT_CLASSES = "backpack,handbag,suitcase"
+#: The classes this use case supports: personal belongings the deployed COCO detector (YOLO26-L,
+#: 80 classes - verified from the engine's own metadata, 2026-10-05) reports, by COCO id. "luggage" is
+#: COCO "suitcase". COCO has NO wallet, purse, box or package class, so the deployed detector cannot
+#: report one and it cannot be enabled here: that needs a custom-trained class (docs/ZAYED_UNATTENDED_OBJECT.md).
+#: A phone in a hand is attended (inside the person's box): only a phone left behind can alert. That is
+#: not MOBILE_PHONE_DETECTED (phone_use.py, a person using a phone), which is unchanged.
+SUPPORTED_CLASSES = {24: "backpack", 26: "handbag", 28: "suitcase", 63: "laptop", 67: "cell phone"}
+CLASS_ALIASES = {"backpack": 24, "handbag": 26, "suitcase": 28, "luggage": 28, "laptop": 63,
+                 "cell phone": 67, "cell_phone": 67, "phone": 67, "mobile phone": 67, "mobile_phone": 67}
+DEFAULT_CLASSES = "backpack,handbag,suitcase,laptop,cell phone"
+
+#: Classes that may continue each other's episode (see _same_object_class). The detector calls one bag "backpack" on one frame
+#: and "handbag" on the next, so bags continue each other; a laptop and a phone are their own groups - a
+#: laptop beside a bag, or a phone lying on a laptop, is a second object, never a fragment or a
+#: continuation of it. (Boxes that COINCIDE are still one object whatever the classes - in one frame,
+#: see _dedupe; on successive frames, see _same_object_class.)
+CLASS_GROUPS = {24: "bag", 26: "bag", 28: "bag", 63: "laptop", 67: "phone"}
+
+
+def same_group(class_a, class_b):
+    return CLASS_GROUPS.get(class_a, class_a) == CLASS_GROUPS.get(class_b, class_b)
+
+
+def _same_object_class(episode, obj):
+    """Whether, as far as its class goes, this detection can be the episode's object: the same class
+    group, or a box that coincides with the episode's latest one (one object the detector calls by two
+    names on different frames, e.g. a laptop sleeve "laptop" then "handbag"). Anything else is another
+    object - including a phone or laptop that the class-agnostic object tracker handed a coasting bag's
+    track id (JeztSort's centroid second pass)."""
+    return same_group(episode["class_id"], obj.class_id) or _iou(obj.bbox, episode["bbox"]) >= DUPLICATE_IOU
 
 
 def parse_classes(spec, log=print):
@@ -252,6 +277,8 @@ def _dedupe(object_tracks):
     """One track per physical object this frame: highest confidence wins."""
     kept = []
     for obj in sorted(object_tracks, key=lambda t: getattr(t, "confidence", 0.0) or 0.0, reverse=True):
+        # Across ALL classes, unlike association and fragments: two near-identical boxes are one object
+        # under two labels (a laptop bag as "laptop" AND "handbag"), and two alerts would be a duplicate.
         if all(_iou(obj.bbox, k.bbox) < DUPLICATE_IOU for k in kept):
             kept.append(obj)
     return kept
@@ -377,9 +404,9 @@ class AbandonedObjectDetector:
             episode = self._associate(camera_id, obj, cx, cy, now, claimed)
             if episode is None:
                 continue                         # a fragment of an object already seen this frame
-            claimed[episode["episode_id"]] = list(obj.bbox)
+            claimed[episode["episode_id"]] = (list(obj.bbox), obj.class_id)
             episode, alert = self._observe(episode, obj, cx, cy, now, person_boxes, prox_radius)
-            claimed[episode["episode_id"]] = list(obj.bbox)
+            claimed[episode["episode_id"]] = (list(obj.bbox), obj.class_id)
             if alert is not None:
                 fired.append(alert)
 
@@ -397,13 +424,16 @@ class AbandonedObjectDetector:
 
     # ------------------------------------------------------------------ association
     def _associate(self, camera_id, obj, cx, cy, now, claimed):
-        """The episode this detection belongs to: its track's, else an unseen nearby one of similar
-        size and compatible class still inside the recovery window, else a new one. None when it is
-        a fragment of an episode already seen this frame."""
+        """The episode this detection belongs to: its track's (class permitting), else an unseen nearby
+        one of similar size and compatible class still inside the recovery window, else a new one.
+        None when it is a fragment of an episode already seen this frame."""
         episode = self._episodes.get(self._track_episode.get((camera_id, obj.track_id)))
-        if episode is not None and episode["state"] != RESOLVED and episode["episode_id"] not in claimed:
+        if (episode is not None and episode["state"] != RESOLVED and episode["episode_id"] not in claimed
+                and _same_object_class(episode, obj)):
             return episode
-        for box in claimed.values():
+        for box, class_id in claimed.values():
+            if not same_group(obj.class_id, class_id):
+                continue                         # a phone on a laptop is a second object
             if _iou(obj.bbox, box) >= FRAGMENT_IOU or _point_to_box_distance(cx, cy, box) == 0.0:
                 return None
         best, best_distance = None, None
@@ -411,7 +441,8 @@ class AbandonedObjectDetector:
             if (ep["camera_id"] != camera_id or ep["state"] == RESOLVED or ep["episode_id"] in claimed
                     or now - ep["last_seen"] > RECOVERY_WINDOW_SECONDS):
                 continue
-            if ASSOCIATION_STRICT_CLASS and ep["class_id"] != obj.class_id:
+            if (ep["class_id"] != obj.class_id if ASSOCIATION_STRICT_CLASS
+                    else not _same_object_class(ep, obj)):
                 continue
             if not _similar_size(obj.bbox, ep["anchor_bbox"]):
                 continue

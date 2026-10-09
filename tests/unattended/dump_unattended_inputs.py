@@ -13,11 +13,12 @@ WHAT IT REPRODUCES (zayed_inference.py process_result, one camera)
   * one inferred frame in three (TARGET_INFERENCE_FPS 10 of ~30), per clip;
   * YOLO26-L TensorRT at 640, predict floor = predict_confidence() with unattended + phone armed;
   * the camera's allowed classes (person, the unattended classes, phone - object_detection is OFF in
-    production), person >= the camera's 0.45, carried >= abandoned.OBJECT_CONFIDENCE, phones kept
-    out of the tracker;
+    production) routed by detection_routing.route - the live loop's own function - with unattended and
+    mobile-phone detection armed: person >= 0.45, unattended classes >= abandoned.OBJECT_CONFIDENCE,
+    phones to the phone analytic and, as an unattended class, to the tracker;
   * tracking.TrackManager with the live class groups, then the live EMA box smoothing;
   * the analytic's inputs: carried tracks of abandoned.CANDIDATE_CLASS_IDS and the boxes of the
-    person tracks of that frame.
+    person tracks of that frame; and the phone analytic's input (raw phone boxes) as "phones".
 Stage 2 (evaluate_unattended.py) replays the dump through any version of abandoned.py, CPU only.
 
 ISOLATION
@@ -36,6 +37,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 import cv2  # noqa: E402
 
 import abandoned  # noqa: E402
+import detection_routing  # noqa: E402
 import object_logger  # noqa: E402
 import phone_use  # noqa: E402
 import tracking  # noqa: E402
@@ -49,26 +51,31 @@ PHONE_CLASSES = {phone_use.PHONE_CLASS_ID}
 PREDICT_CONF = min(CAMERA_CONF, abandoned.OBJECT_CONFIDENCE, phone_use.PHONE_CONFIDENCE)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--camera", required=True)
-    ap.add_argument("--clip", action="append", required=True, help="PATH@OFFSET_SECONDS (repeat, in order)")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--phase", type=int, default=0)
-    ap.add_argument("--detect-engine", default="/engines/zayed/current/yolo26l.engine")
-    args = ap.parse_args()
+LEGACY_CLASSES = {24, 26, 28}       # f4e16a9 (deployed 2026-10-02): bags only, phones never tracked
 
-    from ultralytics import YOLO
-    detector = YOLO(args.detect_engine, task="detect")
+
+def legacy_route(cls, conf):
+    """The deployed f4e16a9 loop, for a like-for-like regression run (--legacy-routing)."""
+    if cls not in PERSON_CLASSES | LEGACY_CLASSES | PHONE_CLASSES:
+        return False, False
+    if cls in PHONE_CLASSES and conf >= phone_use.PHONE_CONFIDENCE:
+        return True, False
+    if conf < CAMERA_CONF and not (cls in LEGACY_CLASSES and conf >= abandoned.OBJECT_CONFIDENCE):
+        return False, False
+    return False, True
+
+
+def run_sequence(detector, camera, clip_specs, out_path, phase, legacy, stats):
+    """One tracker over contiguous clips (PATH@OFFSET); writes one jsonl.gz."""
     tracker = tracking.TrackManager(
         person_classes=PERSON_CLASSES, vehicle_classes=set(),
         class_names=dict(enumerate(object_logger.COCO_NAMES)),
         object_classes=CARRIED_CLASSES | PHONE_CLASSES | object_logger.LOGGABLE_CLASS_IDS)
     allowed = PERSON_CLASSES | CARRIED_CLASSES | PHONE_CLASSES
-    smooth, predict_ms, failures, inferred, clips = {}, [], 0, 0, []
-    started = time.perf_counter()
-    with gzip.open(args.out, "wt") as out:
-        for spec in args.clip:
+    followed = LEGACY_CLASSES if legacy else set(abandoned.CANDIDATE_CLASS_IDS)
+    smooth, clips = {}, []
+    with gzip.open(out_path, "wt") as out:
+        for spec in clip_specs:
             path, offset = spec.rsplit("@", 1)
             offset = float(offset)
             cap = cv2.VideoCapture(path)
@@ -76,7 +83,7 @@ def main():
             step = max(1, int(round(fps / TARGET_FPS)))
             index = decoded = 0
             while True:
-                if index % step != args.phase:
+                if index % step != phase:
                     if not cap.grab():
                         break
                     index += 1
@@ -93,24 +100,24 @@ def main():
                     result = detector.predict(source=[frame], imgsz=640, conf=PREDICT_CONF, device="cuda:0",
                                               verbose=False)[0]
                 except Exception as exc:                  # noqa: BLE001 - counted like the live loop
-                    failures += 1
+                    stats["failures"] += 1
                     print(f"predict failed at t={t:.1f}: {type(exc).__name__}: {exc}", flush=True)
                     continue
-                predict_ms.append((time.perf_counter() - t0) * 1000.0)
-                inferred += 1
-                detections = []
+                t1 = time.perf_counter()
+                stats["predict_ms"].append((t1 - t0) * 1000.0)
+                stats["inferred"] += 1
+                detections, phones = [], []
                 if result.boxes is not None and len(result.boxes):
                     for cls, conf, box in zip(result.boxes.cls.cpu().numpy().astype(int),
                                               result.boxes.conf.cpu().numpy(), result.boxes.xyxy.cpu().numpy()):
                         cls, conf = int(cls), float(conf)
-                        if cls not in allowed:
-                            continue
-                        if cls in PHONE_CLASSES and conf >= phone_use.PHONE_CONFIDENCE:
-                            continue                     # phones go to the phone analytic, never the tracker
-                        if conf < CAMERA_CONF and not (cls in CARRIED_CLASSES and conf >= abandoned.OBJECT_CONFIDENCE):
-                            continue
-                        detections.append((cls, conf, tuple(int(v) for v in box)))
-                tracked = tracker.update(args.camera, detections, now=t)
+                        to_phone, to_tracker = (legacy_route(cls, conf) if legacy else detection_routing.route(
+                            cls, conf, allowed=allowed, min_confidence=CAMERA_CONF, abandon_armed=True, phone_armed=True))
+                        if to_phone:
+                            phones.append([round(conf, 3), *[int(v) for v in box]])
+                        if to_tracker:
+                            detections.append((cls, conf, tuple(int(v) for v in box)))
+                tracked = tracker.update(camera, detections, now=t)
                 for tr in tracked:                       # zayed_inference.py EMA box smoothing, verbatim maths
                     key = tr.track_id
                     rx1, ry1, rx2, ry2 = tr.bbox
@@ -121,24 +128,59 @@ def main():
                     tr.bbox = [int(v) for v in s]
                 for gone in [k for k in smooth if k not in {tr.track_id for tr in tracked}]:
                     del smooth[gone]
+                stats["track_ms"].append((time.perf_counter() - t1) * 1000.0)
                 objects = [[tr.track_id, tr.raw_track_id, tr.class_id, tr.class_name, round(tr.confidence, 3),
                             *tr.bbox] for tr in tracked
-                           if tr.group == tracking.OBJECT_GROUP and tr.class_id in abandoned.CANDIDATE_CLASS_IDS]
+                           if tr.group == tracking.OBJECT_GROUP and tr.class_id in followed]
                 persons = [list(tr.bbox) for tr in tracked if tr.group == tracking.PERSON_GROUP]
                 out.write(json.dumps({"t": round(t, 3), "w": width, "h": height, "objects": objects,
-                                      "persons": persons}) + "\n")
+                                      "persons": persons, "phones": phones}) + "\n")
             cap.release()
             clips.append({"clip": os.path.basename(path), "offset": offset, "fps": round(fps, 3),
                           "frames_read": index, "frames_inferred": decoded})
+    return clips
+
+
+def pct(values, q):
+    values = sorted(values)
+    return round(values[min(len(values) - 1, int(len(values) * q))], 2) if values else None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--camera", required=True)
+    ap.add_argument("--clip", action="append", required=True, help="PATH@OFFSET_SECONDS (repeat, in order)")
+    ap.add_argument("--out", required=True, help="a .jsonl.gz, or a directory with --separate")
+    ap.add_argument("--separate", action="store_true", help="each --clip is its own sequence (fresh tracker)")
+    ap.add_argument("--legacy-routing", action="store_true", help="the deployed f4e16a9 inputs (bags only)")
+    ap.add_argument("--phase", type=int, default=0)
+    ap.add_argument("--detect-engine", default="/engines/zayed/current/yolo26l.engine")
+    args = ap.parse_args()
+
+    from ultralytics import YOLO
+    detector = YOLO(args.detect_engine, task="detect")
+    stats = {"predict_ms": [], "track_ms": [], "failures": 0, "inferred": 0}
+    started = time.perf_counter()
+    if args.separate:
+        os.makedirs(args.out, exist_ok=True)
+        clips = []
+        for spec in args.clip:
+            name = os.path.basename(spec.rsplit("@", 1)[0]).rsplit(".", 1)[0]
+            clips += run_sequence(detector, args.camera, [spec], os.path.join(args.out, name + ".jsonl.gz"),
+                                  args.phase, args.legacy_routing, stats)
+        summary_path = os.path.join(args.out, "summary.json")
+    else:
+        clips = run_sequence(detector, args.camera, args.clip, args.out, args.phase, args.legacy_routing, stats)
+        summary_path = args.out.replace(".jsonl.gz", ".summary.json")
     wall = time.perf_counter() - started
-    predict_ms.sort()
-    summary = {"camera": args.camera, "clips": clips, "inferred": inferred, "prediction_failures": failures,
-               "wall_seconds": round(wall, 1), "frames_per_second": round(inferred / wall, 1) if wall else None,
-               "predict_ms_p50": round(predict_ms[len(predict_ms) // 2], 1) if predict_ms else None,
-               "predict_ms_p95": round(predict_ms[int(len(predict_ms) * 0.95)], 1) if predict_ms else None}
-    with open(args.out.replace(".jsonl.gz", ".summary.json"), "w") as f:
+    summary = {"camera": args.camera, "legacy_routing": args.legacy_routing, "clips": clips,
+               "inferred": stats["inferred"], "prediction_failures": stats["failures"], "wall_seconds": round(wall, 1),
+               "frames_per_second": round(stats["inferred"] / wall, 1) if wall else None,
+               "predict_ms_p50": pct(stats["predict_ms"], 0.5), "predict_ms_p95": pct(stats["predict_ms"], 0.95),
+               "track_ms_p50": pct(stats["track_ms"], 0.5), "track_ms_p95": pct(stats["track_ms"], 0.95)}
+    with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
-    print(json.dumps(summary), flush=True)
+    print(json.dumps({k: v for k, v in summary.items() if k != "clips"}), flush=True)
 
 
 if __name__ == "__main__":

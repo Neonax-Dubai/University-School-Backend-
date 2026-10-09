@@ -40,6 +40,7 @@ import torch
 from ultralytics import YOLO
 
 import abandoned
+import detection_routing
 import camera_health
 import dashboard
 import evacuation
@@ -84,7 +85,8 @@ METRICS_PATH = os.getenv("METRICS_PATH", os.path.join(HERE, "runtime", "metrics.
 DEVICE = "cuda:0"
 
 PERSON_CLASSES = {0}
-#: Carried items for the unattended-object analytic: backpack, handbag, suitcase.
+#: Objects the unattended-object analytic follows (abandoned.CANDIDATE_CLASS_IDS): backpack, handbag,
+#: suitcase, laptop, cell phone by default.
 CARRIED_CLASSES = set(abandoned.CANDIDATE_CLASS_IDS)
 PHONE_CLASSES = {67}                                   # COCO "cell phone"
 CLASS_NAMES = dict(enumerate(object_logger.COCO_NAMES))
@@ -581,18 +583,17 @@ def process_result(result, metadata, source_frame):
         abandon_armed = abandoned_detector.enabled_for(camera_id)
         phone_armed = phone_detector.enabled_for(camera_id)
         for class_id, confidence, box in zip(class_ids, confidences, xyxy):
-            if class_id not in allowed:
-                continue
-            if phone_armed and class_id == phone_use.PHONE_CLASS_ID and confidence >= phone_use.PHONE_CONFIDENCE:
-                # Phones go to the phone analytic at their own floor and stay out of the tracker.
+            # ZAYED (detection_routing): phones go to the phone analytic at their own floor, as
+            # before; a phone also reaches the tracker only when "cell phone" is an unattended class
+            # here, so a phone left behind can become an unattended episode.
+            to_phone, to_tracker = detection_routing.route(
+                class_id, confidence, allowed=allowed, min_confidence=min_confidence,
+                abandon_armed=abandon_armed, phone_armed=phone_armed)
+            if to_phone:
                 phones.append((float(confidence), [float(v) for v in box]))
-                continue
-            if confidence < min_confidence and not (
-                    abandon_armed and int(class_id) in abandoned.CANDIDATE_CLASS_IDS
-                    and confidence >= abandoned.OBJECT_CONFIDENCE):
-                continue
-            detections.append((int(class_id), float(confidence),
-                               (int(box[0]), int(box[1]), int(box[2]), int(box[3]))))
+            if to_tracker:
+                detections.append((int(class_id), float(confidence),
+                                   (int(box[0]), int(box[1]), int(box[2]), int(box[3]))))
 
     tracked_objects = track_manager.update(camera_id, detections, now=observed_at)
 

@@ -25,6 +25,6 @@ for spec in "$@"; do
   MOUNTS+=(-v "$clip":/clips/$i/"$name":ro); ARGS+=(--clip "/clips/$i/$name@$offset")
 done
 docker run --rm --network none --gpus all --user "$(id -u):983" --name "${REPLAY_NAME:-unattended-dump-$CAMERA}" \
-  -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 -e YOLO_CONFIG_DIR=/tmp -e MPLCONFIGDIR=/tmp/mpl \
+  -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 -e DETECTOR_IMGSZ="${DETECTOR_IMGSZ:-640}" -e TRACK_DIST_THRESH="${TRACK_DIST_THRESH:-250}" -e YOLO_CONFIG_DIR=/tmp -e MPLCONFIGDIR=/tmp/mpl \
   "${MOUNTS[@]}" --entrypoint python3 zayed/inference:25.11 -u /app/tests/unattended/dump_unattended_inputs.py \
   --camera "$CAMERA" --out "/out/$(basename "$OUT")" "${ARGS[@]}" 2>&1 | grep -vE "^\s*$|TensorRT|TRT\]|Loading|WARNING ⚠️|Ultralytics Settings|yolo settings"

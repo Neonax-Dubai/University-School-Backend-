@@ -43,6 +43,8 @@ import phone_use  # noqa: E402
 import tracking  # noqa: E402
 
 TARGET_FPS = 10.0
+#: The production detector input size (zayed_inference.IMG_SIZE reads the same variable). Was a hardcoded 640.
+IMG_SIZE = int(os.getenv("DETECTOR_IMGSZ", "640"))
 CAMERA_CONF = 0.45
 SMOOTH_ALPHA = 0.45
 PERSON_CLASSES = {0}
@@ -97,7 +99,7 @@ def run_sequence(detector, camera, clip_specs, out_path, phase, legacy, stats):
                 height, width = frame.shape[:2]
                 t0 = time.perf_counter()
                 try:
-                    result = detector.predict(source=[frame], imgsz=640, conf=PREDICT_CONF, device="cuda:0",
+                    result = detector.predict(source=[frame], imgsz=IMG_SIZE, conf=PREDICT_CONF, device="cuda:0",
                                               verbose=False)[0]
                 except Exception as exc:                  # noqa: BLE001 - counted like the live loop
                     stats["failures"] += 1

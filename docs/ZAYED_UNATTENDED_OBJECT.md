@@ -328,3 +328,27 @@ Each clip starts from empty state. An object already in place therefore alerts 3
    - A laptop sleeve can be detected as "laptop" or "handbag". It still raises one alert (§10.5), named by its majority class.
 3. **A phone on a desk counts as attended** while anyone is within the proximity radius (about 389 px at C101), the same rule as for bags.
 4. **Phone evidence crops are small:** a median short side of 62 px before padding.
+
+### 10.7 Re-validation at the production settings (2026-10-09) and deployment
+
+§10.6 ran at detector size 640 with its headline numbers at `TRACK_DIST_THRESH` 150. Production runs **960** (`DETECTOR_IMGSZ`, since 2026-10-06) and **250** (committed in 2f5fe30). The replay was repeated at exactly those settings before deployment. `tests/unattended/` now passes `DETECTOR_IMGSZ` and `TRACK_DIST_THRESH` through instead of a hardcoded 640.
+
+**Footage.** The 74 of §10.6's 76 clips that still exist (two short 09-30 camera_01 clips were deleted): 43 camera_01, 20 camera_02, 11 camera_03. That is 181,706 inferred frames per routing, 0 prediction failures. Each clip was run with the new routing and with the deployed (f4e16a9) routing on the same frames, then evaluated with the new and the deployed `abandoned.py` respectively.
+
+| Check | Result |
+|---|---|
+| Bag alerts and resolutions, new vs deployed | **identical in 74/74 clips** (27 alerts each; ±2 s, same resolution) |
+| Possible duplicate alerts | **0** on all three cameras |
+| `phone_use` input (`MOBILE_PHONE_DETECTED`) | 181,651 / 181,706 frames identical; 55 differ by TensorRT FP16 run-to-run noise (48 in the third decimal of confidence, the rest a 1 px box or a box at 0.302 crossing 0.30) - 2 boxes in 40,118 |
+| Laptop | **18 alerts, all genuine**, on 6 physical laptops: the C101 desk laptop (13 overlapping POC clips), the 09-12 lesson laptop and its laptop sleeve (both `attended` when the owner returned), a C101 desk laptop, a C101 back-row laptop about 13 m away (new at 960, confidence median 0.38), and a C201 desk laptop |
+| Cell phone | **10 alerts on 4 physical objects**: 3 genuine phones left on desks (the 09-12 lesson phone, 31 track ids, one alert, `attended`; two POC desks) and **1 key fob labelled "cell phone"** beside the C101 laptop (7 clips) |
+| Phones held or in use | 0 alerts. 587 phone episodes formed, 26 became unattended, 10 alerted - every one on a desk with nobody near. The 29-minute C201 phone-use lesson: 0 alerts |
+| Negative windows | 0 laptop/phone alerts on camera_03 (all 11 clips), the 09-30 C101 recording (100 min), the 09-26 recordings and the C201 lesson recordings |
+| Tracker-id changes | one alert per episode up to 31 track ids (phone) and 13 (laptop) |
+| Cost | tracker update p50 0.87 -> 0.94 ms per frame; `abandoned.update` p50 2.3 -> 11.8 µs |
+
+**The key fob, and why there is no phone-specific threshold.** The fob is genuinely unattended, but it is not a phone. Its detections are "cell phone" at 0.25-0.40 (median 0.258-0.309 per clip). A phone-only observation floor at `phone_use.PHONE_CONFIDENCE` (0.30) was tried on the same dumps and rejected: it removed the fob in 4 of 7 clips, still alerted in 3, and lost the genuine phone beside the laptop in `phone_use_07`, because the medians overlap (genuine 09-12 phone 0.314). Peak confidence happens to separate them here (fob <= 0.40, phones 0.62-0.86), but one mislabelled object against three phones is not evidence for a rule. The class is shipped with the limitation stated: **an unattended "Cell phone" can be another small dark personal item.**
+
+**False negatives seen.** A black phone lying face-down behind the C101 laptop was never detected at 960 (0 of 688 frames), nor at 640. A phone beside the back-row laptop was not alerted.
+
+**Deployed 2026-10-09** with `ABANDON_CLASSES=backpack,handbag,suitcase,laptop,cell phone`. **Rollback without a code change:** set `ABANDON_CLASSES` to `backpack,handbag,suitcase` and recreate the container. Phones then route only to `phone_use` and laptops are not tracked - exactly the f4e16a9 inputs (pinned by `test_detection_routing`).

@@ -97,6 +97,9 @@ class CameraStream:
 
         # For testing local video files (loop them forever).
         self.loop_video = loop_video
+        #: True once an UNLOOPED local file has played to its end. The reader then stops
+        #: instead of reconnecting, so a replay is exactly one pass. Never set for RTSP.
+        self.finished = False
 
         # Decode plumbing
         self.proc = None
@@ -125,6 +128,9 @@ class CameraStream:
     # ------------------------------------------------------------------ probe
     def _is_rtsp(self):
         return self.source.lower().startswith(("rtsp://", "rtsps://"))
+
+    def _is_local_file(self):
+        return not self._is_rtsp() and os.path.isfile(self.source)
 
     def _probe(self):
         """Read width/height/codec once so we know the raw frame size."""
@@ -203,6 +209,26 @@ class CameraStream:
         # Loop local files for testing; irrelevant for live RTSP.
         if self.loop_video and not self._is_rtsp():
             cmd += ["-stream_loop", "-1"]
+
+        # ZAYED 2026-10-11: pace a local file at its native frame rate.
+        #
+        # Without -re ffmpeg decodes the file as fast as the GPU allows - measured at 3.37x
+        # real time (a 60.0 s clip replayed in 17.80 s). Frame-by-frame analytics do not care,
+        # but every DWELL does: camera health, sleeping, unattended objects and phone use all
+        # count seconds in the packet timestamp, which is wall clock (the "timestamp":
+        # time.time() below). A 14 s lens cover therefore occupied 4.15 s of detector time
+        # against an 8 s tamper dwell and could never raise, and the 2026-10-06 sleeping
+        # replays needed clips looped into "sustained" versions for the same reason.
+        #
+        # Deliberately NOT inside the loop branch above. Pacing is a property of reading a
+        # FILE, not of looping it: replay_zayed_inference.py passes loop_video=args.loop, so
+        # without --loop that branch never runs and the first version of this fix was dead
+        # code - the ffmpeg process still carried neither -stream_loop nor -re.
+        #
+        # Input option, so it must precede -i. RTSP already arrives in real time and is left
+        # alone; double-throttling a live stream would build latency.
+        if not self._is_rtsp():
+            cmd += ["-re"]
 
         # Input options are demuxer-specific.
         if self._is_rtsp():
@@ -338,10 +364,12 @@ class CameraStream:
                 continue
 
             # Pump frames until the process dies.
+            reached_end = False
             while self.running:
                 data = self._read_exact(frame_size)
 
                 if data is None:                       # ffmpeg exited / stream lost
+                    reached_end = True
                     break
 
                 # bytearray backing => writable array, no extra copy needed.
@@ -385,6 +413,23 @@ class CameraStream:
 
             # Stream ended — tear down and reconnect (unless we're stopping).
             self._close_proc()
+
+            # ZAYED 2026-10-11: an UNLOOPED local file is played exactly once. Before this the
+            # reader treated the file's end like a lost RTSP stream and reconnected, so a replay
+            # without --loop restarted the clip indefinitely (40 passes in 10.5 min on
+            # 2026-10-11): every pass re-emitted its events, and each restart's jump back to
+            # t=0 looked like a lighting change to camera health. Only the decoder's pipe ending
+            # counts (end of file, or the stall watchdog killing it) - a frame-size mismatch
+            # still reconnects. Live RTSP is never a local file, so production reconnect
+            # behaviour is unchanged.
+            if (reached_end and self.running and not self.loop_video
+                    and self._is_local_file()):
+                self.finished = True
+                self.running = False
+                print(f"[{self.camera_id}] Video ended - single pass complete "
+                      f"({self.frames_read} frames)", flush=True)
+                break
+
             if self.running:
                 if not self._is_rtsp() and self.loop_video:
                     print(f"[{self.camera_id}] Video ended - restarting")

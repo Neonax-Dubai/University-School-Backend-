@@ -88,6 +88,28 @@ STRUCTURAL_OVERLAP_LIGHTING_MIN = _env_float("CAMERA_HEALTH_STRUCTURAL_OVERLAP_L
 # still confirms that cover (see tests/camera_health/test_camera_tamper_structure_gate.py).
 TAMPER_STRUCTURE_INTACT_MIN = _env_float("CAMERA_HEALTH_TAMPER_STRUCTURE_INTACT_MIN", 0.65)
 LIGHTING_MIN_BRIGHTNESS_RATIO = _env_float("CAMERA_HEALTH_LIGHTING_MIN_BRIGHTNESS_RATIO", 1.3)
+# ZAYED 2026-10-10: sharpness floor below which "this is just a lighting change" stops being a
+# credible explanation. sharpness is var(Laplacian)/var(image) - deliberately lighting-normalised,
+# so re-lighting the SAME view barely moves it (this module's own calibration: ratio 1.01 at 28%
+# gain) while something over the glass collapses it (<= 0.08 of baseline). Measured on the
+# 2026-09-30 covers the guard was wrongly excusing: camera_03 0.085, camera_01 0.013-0.089.
+#
+# ZAYED 2026-10-12: lowered 0.5 -> 0.35 after replaying the real clips through this module
+# (tests/camera_health/run_tamper_replay.sh). Re-lighting does NOT always keep sharpness near 1:
+# when the room goes dark the image loses contrast with it. On camera_01's 2026-10-09 19:50
+# lights-off the ratio fell to 0.465-0.476, under the old floor, so this guard overrode
+# structure_intact and began a tamper candidate on a light switch - the guard was making a
+# false positive MORE likely, not less. Measured either side of the boundary:
+#
+#     genuine cover (camera_03 2026-09-30)   0.088, 0.145, 0.271
+#     lights-off    (camera_01 2026-10-09)   0.465, 0.476
+#
+# 0.35 is the midpoint of that gap (~1.3x clear of each side). It still rejects the lighting
+# and structure excuses for every genuine cover measured, and no longer fires on a light
+# switch. It is now below DEFOCUS_RATIO, so "collapsed" here is deliberately stricter than
+# "out of focus": this guard overrides a safeguard and must be the harder of the two to trip.
+LIGHTING_SHARPNESS_COLLAPSE_RATIO = _env_float(
+    "CAMERA_HEALTH_LIGHTING_SHARPNESS_COLLAPSE_RATIO", 0.35)
 
 
 def scene_signature(gray):
@@ -145,6 +167,32 @@ def lighting_transition(state, gray):
                                          state.edge_baseline, base_brightness)
     ok = ratio >= LIGHTING_MIN_BRIGHTNESS_RATIO and overlap >= STRUCTURAL_OVERLAP_LIGHTING_MIN
     return ok, {"brightness_ratio": round(ratio, 3), "structural_overlap": round(overlap, 3)}
+
+
+def lighting_sharpness_credible(state, gray):
+    """Is a lighting explanation still credible for this sample? (ok, detail)
+
+    Brightness and structural overlap alone cannot separate "the lights changed" from "a hand
+    is over the lens near a window": on the 2026-09-30 covers both measured like a lighting
+    change (brightness 1.31-2.45, overlap 0.83-0.99) and the guard discarded a real tamper
+    candidate at 6.0 s of the required 8.0 s.
+
+    Sharpness separates them, because the metric is lighting-normalised by construction. A
+    re-lit view keeps its edges; a covered one does not.
+
+    Conservative when it cannot tell: with no sharpness baseline yet - including straight after
+    a genuine lighting reset, which clears it - this returns True and the guard behaves exactly
+    as it did before. Missing data must never be what switches the guard off.
+    """
+    baseline = state.sharpness_baseline
+    if baseline is None or baseline <= 1e-9:
+        return True, {"sharpness_check": "no baseline"}
+    value = metrics.sharpness(metrics.ensure_sample(gray))
+    ratio = value / baseline
+    return ratio >= LIGHTING_SHARPNESS_COLLAPSE_RATIO, {
+        "sharpness_ratio": round(ratio, 3),
+        "sharpness_floor": LIGHTING_SHARPNESS_COLLAPSE_RATIO,
+    }
 
 
 def _guard_blocked(state, obstructed):
@@ -212,12 +260,23 @@ def tamper_state(state, gray, now, obstructed):
     if bad and not _guard_blocked(state, obstructed):
         ok, check = lighting_transition(state, gray)
         if ok:
+            # ZAYED 2026-10-10: brightness + overlap said "lighting change". Ask sharpness
+            # whether that is credible before acting on it, because reset_image_baselines()
+            # below would otherwise learn the COVERED view as the new normal scene - the
+            # obstruction becomes the baseline and the tamper can never raise afterwards.
+            credible, sharp_check = lighting_sharpness_credible(state, gray)
+            check.update(sharp_check)
+            if not credible:
+                check["lighting_rejected"] = "sharpness collapsed"
+                detail["lighting_check"] = check
+                ok = False
+        if ok:
             state.illumination_resets += 1
             state.reset_image_baselines()
             detail.update(check)
             detail["illumination_transition"] = True
             return False, detail
-        detail["lighting_check"] = check
+        detail.setdefault("lighting_check", check)
 
         # ZAYED. Camera Tampering means the view was REPLACED. structural_overlap is the
         # share of the baseline's strong edges still present, and this module's own
@@ -232,7 +291,28 @@ def tamper_state(state, gray, now, obstructed):
         # frame at stream start. None of them is interference, and each one cost an operator
         # a critical alarm.
         overlap = check.get("structural_overlap")
-        if overlap is not None and overlap >= TAMPER_STRUCTURE_INTACT_MIN:
+        structure_intact = overlap is not None and overlap >= TAMPER_STRUCTURE_INTACT_MIN
+        if structure_intact:
+            # ZAYED 2026-10-11: the rule above reads a high overlap as "the baseline's edges are
+            # still there, so nothing covered the lens". That inference holds for the false raises
+            # it was built for - a drifted scene, a replayed clip, a baseline learned on a
+            # transient frame - every one of them IN FOCUS. It does not hold for a PARTIAL cover.
+            #
+            # Traced on the real 2026-09-30 camera_03 episode: the occluded phase lasts 6 s
+            # (overlap 0.10-0.62), then the hand slides partly off, overlap creeps back over 0.65
+            # and every later sample returns None - so no further bad sample arrives to carry the
+            # candidate past TAMPER_SECONDS. The cover died two seconds short of raising.
+            #
+            # Sharpness tells the two apart, and it is the same metric and floor the lighting
+            # guard already uses: wrongly rejected 0.085 / 0.141 / 0.200, rightly rejected 0.604
+            # (a transitional frame) and 1.321 (camera_01, in focus). The gate keeps its meaning;
+            # it just may no longer conclude "nothing covered the lens" from a soft image.
+            credible, sharp_check = lighting_sharpness_credible(state, gray)
+            if not credible:
+                check.update(sharp_check)
+                detail["structure_intact_rejected"] = "sharpness collapsed"
+                structure_intact = False
+        if structure_intact:
             state.structure_intact_rejects += 1
             detail["structure_intact"] = True
             if state.structure_intact_since is None:

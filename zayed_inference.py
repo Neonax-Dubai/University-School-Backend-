@@ -42,6 +42,7 @@ from ultralytics import YOLO
 import abandoned
 import detection_routing
 import camera_health
+from camera_health import sample as camera_health_sample
 import dashboard
 import evacuation
 import events
@@ -266,7 +267,7 @@ event_pipeline.update_camera_intervals({c.camera_id: {"intrusion": c.intrusion_i
 
 
 def handle_camera_health_event(camera_id, event_type, timestamp, metadata,
-                               action, frame_width, frame_height):
+                               action, frame_width, frame_height, sample=None):
     """One confirmed camera-health state transition onto the EXISTING pipeline. (Dubai, verbatim)
 
     No bbox and no frame of its own: the condition is a property of the whole image, so the
@@ -286,6 +287,7 @@ def handle_camera_health_event(camera_id, event_type, timestamp, metadata,
         observed_at=timestamp,
         bbox=[0, 0, width, height],
         scope=action,
+        diagnostic=camera_health_sample.health_sample_jpeg(sample),
     )
     if result == "sent":
         print(f"[CAM_HEALTH] {camera_id} {event_type} {action} -> event sent")

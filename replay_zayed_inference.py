@@ -478,7 +478,9 @@ class ZayedReplay:
 
     # ── camera health sink ────────────────────────────────────────────────────
     def _handle_cam_health(self, camera_id, event_type, timestamp, metadata,
-                           action, frame_width, frame_height):
+                           action, frame_width, frame_height, sample=None):
+        # `sample` is the judged frame (ZAYED 2026-10-12). A replay deliberately does NOT
+        # store it: the harness must not write evidence into production storage.
         self.event_pipeline.handle_camera_event(
             camera_id, event_type, metadata,
             frame_width=frame_width or 1920,

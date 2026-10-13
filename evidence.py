@@ -419,15 +419,19 @@ class EvidencePipeline:
 
     # ------------------------------------------------------------- producer
     def submit(self, jpeg, crop_width, crop_height, event, notable, camera_id,
-               track_id, observed_at):
+               track_id, observed_at, kind="crop"):
         """
-        Queue a crop for upload. The event rides along and is sent by the
+        Queue an image for upload. The event rides along and is sent by the
         worker afterwards, so it is never lost if storage misbehaves.
         Returns False only if the queue is saturated, in which case the event
         is sent immediately without evidence rather than dropped.
+
+        `kind` names what the image IS - it becomes both the last path segment of the
+        storage key and the evidence type the dashboard stores, so a diagnostic sample
+        cannot be mistaken for the crop of a subject (ZAYED 2026-10-12).
         """
         item = (jpeg, crop_width, crop_height, event, notable, camera_id,
-                track_id, observed_at)
+                track_id, observed_at, kind)
 
         try:
             self._queue.put_nowait(item)
@@ -460,11 +464,12 @@ class EvidencePipeline:
 
     def _process(self, item):
         (jpeg, crop_width, crop_height, event, notable, camera_id,
-         track_id, observed_at) = item
+         track_id, observed_at, kind) = item
 
         evidence_uid = uuid.uuid4().hex[:12]
 
-        storage_key = build_storage_key(camera_id, track_id, observed_at, evidence_uid)
+        storage_key = build_storage_key(camera_id, track_id, observed_at, evidence_uid,
+                                        kind=kind)
 
         try:
             self.store.put(storage_key, jpeg)
@@ -476,7 +481,7 @@ class EvidencePipeline:
             # keeps its current contract - no new field, no new endpoint.
             event.setdefault("metadata", {})["evidence"] = {
                 "uid": evidence_uid,
-                "type": "crop",
+                "type": kind,
                 "storage_key": storage_key,
                 "backend": self.store.name,
                 "mime_type": "image/jpeg",

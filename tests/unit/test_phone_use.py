@@ -53,6 +53,39 @@ class PhoneUseTests(unittest.TestCase):
         self.d.forget_camera("camera_01")
         self.assertEqual(self.d.stats()["tracked"], 0)
 
+    # ZAYED 2026-11-13: the cooldown also binds by seat, because track ids fragment.
+    def test_same_seat_under_a_new_track_id_is_held_by_the_cooldown(self):
+        self.assertEqual(len(self.feed(8)), 1)
+        same_student_new_id = Track("P-2", [104, 98, 302, 506])
+        self.assertEqual(self.feed(10, start=1060.0, tracks=[same_student_new_id]), [],
+                         "a re-identified student at the same seat is not a new sighting")
+        self.assertEqual(self.d.stats()["seat_suppressed"], 1)
+
+    def test_a_different_seat_still_raises(self):
+        self.assertEqual(len(self.feed(8)), 1)
+        neighbour = Track("P-3", [600, 100, 800, 500])
+        found = self.feed(10, start=1060.0, tracks=[neighbour], phone=(0.6, [680, 250, 720, 290]))
+        self.assertEqual([f.track_id for f in found], ["P-3"])
+
+    def test_the_same_seat_raises_again_after_the_cooldown(self):
+        self.assertEqual(len(self.feed(8)), 1)
+        later = Track("P-4", [100, 100, 300, 500])
+        self.assertEqual(len(self.feed(8, start=1000.0 + P.PHONE_COOLDOWN_SECONDS + 20, tracks=[later])), 1)
+
+    def test_seat_rule_can_be_switched_off(self):
+        saved = P.PHONE_SEAT_IOU
+        P.PHONE_SEAT_IOU = 0.0
+        try:
+            self.assertEqual(len(self.feed(8)), 1)
+            self.assertEqual(len(self.feed(10, start=1060.0, tracks=[Track("P-2", [100, 100, 300, 500])])), 1)
+        finally:
+            P.PHONE_SEAT_IOU = saved
+
+    def test_prune_forgets_old_seats(self):
+        self.feed(8)
+        self.d.prune(1000.0 + P.PHONE_COOLDOWN_SECONDS + 60)
+        self.assertNotIn("camera_01", self.d._recent)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

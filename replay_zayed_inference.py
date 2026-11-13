@@ -478,7 +478,9 @@ class ZayedReplay:
 
     # ── camera health sink ────────────────────────────────────────────────────
     def _handle_cam_health(self, camera_id, event_type, timestamp, metadata,
-                           action, frame_width, frame_height):
+                           action, frame_width, frame_height, sample=None):
+        # `sample` is the judged frame (ZAYED 2026-10-12). A replay deliberately does NOT
+        # store it: the harness must not write evidence into production storage.
         self.event_pipeline.handle_camera_event(
             camera_id, event_type, metadata,
             frame_width=frame_width or 1920,
@@ -843,6 +845,14 @@ class ZayedReplay:
                     frames_window = 0
                     last_status   = time.perf_counter()
 
+                # ── single pass: stop once every clip has played to its end ─
+                # REPLAY FIX 2026-10-11: without --loop CameraStream now plays each file exactly
+                # once (cctv.py `finished`). Exit through the normal shutdown, which stops the
+                # adapters and flushes the event pipeline, once the last frame has been taken.
+                if self._all_clips_finished():
+                    log("[REPLAY] All clips played once - finishing.")
+                    break
+
                 # ── display ────────────────────────────────────────────────
                 if not self.args.headless:
                     grid = self._build_grid(tile_w, tile_h)
@@ -860,6 +870,14 @@ class ZayedReplay:
             log("\n[REPLAY] Interrupted.")
         finally:
             self._shutdown()
+
+    def _all_clips_finished(self):
+        # A camera with no detection classes is never drained by the loop above, so its queue
+        # would never empty; only the queues the loop actually consumes are waited on.
+        return bool(self.streams) and all(
+            cs.finished and (cs.queue_size() == 0
+                             or not self.camera_classes.get(cs.camera_id))
+            for cs in self.streams.values())
 
     def _shutdown(self):
         log("[REPLAY] Shutting down ...")

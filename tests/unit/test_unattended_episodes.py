@@ -13,6 +13,21 @@ import helpers  # noqa: F401
 import abandoned as A
 import events
 
+
+# ZAYED 2026-11-13: these pin the episode STATE MACHINE as it was written, under the previous
+# alert rule. The empty-view gate (ABANDON_REQUIRE_EMPTY_VIEW) is pinned separately in
+# test_unattended_empty_view.py, so it is switched off here rather than rewriting every scene.
+_SAVED_EMPTY_VIEW = None
+
+
+def setUpModule():
+    global _SAVED_EMPTY_VIEW
+    _SAVED_EMPTY_VIEW, A.REQUIRE_EMPTY_VIEW = A.REQUIRE_EMPTY_VIEW, False
+
+
+def tearDownModule():
+    A.REQUIRE_EMPTY_VIEW = _SAVED_EMPTY_VIEW
+
 W, H = 2592, 1944
 CAM, CAM2 = "camera_01", "camera_02"
 RW, AR = A.RECOVERY_WINDOW_SECONDS, A.ATTENDED_RESOLVE_SECONDS   # 120 s, 300 s by default
@@ -21,6 +36,7 @@ FAR_BAG = [300, 1500, 430, 1660]              # another resting place, far from 
 NEAR_PERSON = [1250, 500, 1450, 1100]         # standing beside the bag
 FAR_PERSON = [2200, 200, 2400, 800]           # elsewhere in the room
 OCCLUDER = [1150, 700, 1380, 1300]            # standing IN FRONT of the bag (covers it)
+OCCLUDER_LAPTOP = [1380, 650, 1680, 1250]     # standing in front of the laptop
 
 
 class Obj:
@@ -317,21 +333,226 @@ class ClassConfigTests(unittest.TestCase):
 
     def test_unsupported_classes_are_refused_never_enabled(self):
         logged = []
-        self.assertEqual(A.parse_classes("backpack,box,knife,43,67", log=logged.append), frozenset({24}))
-        self.assertIn("box", logged[0])
+        self.assertEqual(A.parse_classes("backpack,box,knife,43,73,bottle,chair,cup", log=logged.append), frozenset({24}))
+        for refused in ("box", "knife", "43", "73", "bottle", "chair", "cup"):
+            self.assertIn(refused, logged[0])
 
     def test_nothing_valid_falls_back_to_the_validated_default(self):
         logged = []
-        self.assertEqual(A.parse_classes("package", log=logged.append), frozenset({24, 26, 28}))
+        self.assertEqual(A.parse_classes("package", log=logged.append), frozenset({24, 26, 28, 63, 67}))
         self.assertEqual(len(logged), 2)
 
-    def test_the_default_is_the_three_bag_classes(self):
-        self.assertEqual(A.CANDIDATE_CLASS_IDS, frozenset({24, 26, 28}))
+    def test_the_default_is_the_three_bag_classes_plus_laptop_and_cell_phone(self):
+        self.assertEqual(A.CANDIDATE_CLASS_IDS, frozenset({24, 26, 28, 63, 67}))
+        self.assertEqual(sorted(A.SUPPORTED_CLASSES.values()), ["backpack", "cell phone", "handbag", "laptop", "suitcase"])
+
+    def test_laptop_and_cell_phone_are_accepted_by_name_and_id(self):
+        quiet = lambda m: None
+        self.assertEqual(A.parse_classes("laptop", log=quiet), frozenset({63}))
+        for spelling in ("cell phone", "cell_phone", "phone", "Mobile phone", "67"):
+            self.assertEqual(A.parse_classes(spelling, log=quiet), frozenset({67}), spelling)
+
+    def test_wallet_is_not_supported(self):
+        """COCO (the deployed YOLO26-L) has no wallet class: it is refused, never mapped to another."""
+        logged = []
+        self.assertEqual(A.parse_classes("backpack,wallet", log=logged.append), frozenset({24}))
+        self.assertIn("wallet", logged[0])
+        self.assertNotIn("wallet", A.CLASS_ALIASES)
+        self.assertNotIn("wallet", A.SUPPORTED_CLASSES.values())
 
     def test_a_disabled_class_is_ignored(self):
         with mock.patch.object(A, "CANDIDATE_CLASS_IDS", frozenset({28})):
             s = Scene().run(40, lambda e: [Obj("O-1")])
         self.assertEqual(s.alerts, [])
+
+
+LAPTOP = [1400, 950, 1650, 1080]               # an open laptop on a desk, ~250x130 px
+PHONE = [1500, 1000, 1550, 1030]               # a phone lying on the desk, ~50x30 px
+SEATED = [1380, 700, 1600, 1150]               # someone sitting at that desk (laptop/phone in front)
+
+
+def laptop(track="O-L1", box=LAPTOP):
+    return Obj(track, box, 63, "laptop", 0.6)
+
+
+def phone(track="O-P1", box=PHONE, conf=0.4):
+    return Obj(track, box, 67, "cell phone", conf)
+
+
+class EveryClassTests(unittest.TestCase):
+    """1-5: each supported class goes through the same lifecycle - one alert, then a resolution."""
+
+    def test_each_supported_class_alerts_once_and_resolves(self):
+        for class_id, name in sorted(A.SUPPORTED_CLASSES.items()):
+            box = PHONE if class_id == 67 else LAPTOP if class_id == 63 else BAG
+            s = Scene().run(600, lambda e: [Obj("O-1", box, class_id, name)])
+            self.assertEqual([(m["object_type"], m["episode_state"]) for *_, m in s.alerts], [(name, "alerted")], name)
+            s.run(RW + 5)
+            self.assertEqual([m["resolution"] for *_, m in s.resolutions], ["removed"], name)
+
+    def test_an_unsupported_class_never_becomes_a_candidate(self):
+        for class_id, name in ((73, "book"), (39, "bottle"), (41, "cup"), (56, "chair")):
+            s = Scene().run(120, lambda e: [Obj("O-1", LAPTOP, class_id, name)])
+            self.assertEqual((s.alerts, s.det.episodes()), ([], []), name)
+
+
+class LaptopTests(unittest.TestCase):
+    """8-14."""
+
+    def test_a_laptop_left_on_a_desk_becomes_unattended_after_the_dwell(self):
+        s = Scene().run(31, lambda e: [laptop()])
+        self.assertEqual(s.alerts, [], "not before 2 s grace + 30 s dwell")
+        s.run(2, lambda e: [laptop()])
+        self.assertEqual([(m["object_type"], m["track_ids"]) for *_, m in s.alerts], [("laptop", ["O-L1"])])
+
+    def test_a_laptop_in_use_never_alerts(self):
+        s = Scene().run(900, lambda e: [laptop()], lambda e: [SEATED])
+        self.assertEqual(s.alerts, [])
+
+    def test_a_laptop_with_someone_beside_it_never_alerts(self):
+        s = Scene().run(900, lambda e: [laptop()], lambda e: [NEAR_PERSON])
+        self.assertEqual(s.alerts, [])
+
+    def test_a_laptop_keeps_one_episode_through_track_id_changes_and_occlusion(self):
+        ids = ["O-L1", "O-L7", "O-L9", "O-L12"]
+
+        def objects(e):                          # 50 s per id, then 6 s behind someone
+            k, phase = int(e // 56), e % 56
+            return [] if phase >= 50 else [laptop(ids[min(k, 3)])]
+
+        def persons(e):
+            return [OCCLUDER_LAPTOP] if e % 56 >= 50 else [FAR_PERSON]
+        s = Scene().run(224, objects, persons)
+        self.assertEqual(len(s.alerts), 1)
+        self.assertEqual(s.state(s.episode_ids()[0])["track_ids"], ids)
+
+    def test_a_laptop_raises_one_alert_however_long_it_stays(self):
+        s = Scene().run(1800, lambda e: [laptop()], lambda e: [FAR_PERSON])
+        self.assertEqual(len(s.alerts), 1)
+
+    def test_a_removed_laptop_resolves_and_one_put_down_later_is_a_new_episode(self):
+        s = Scene().run(40, lambda e: [laptop()])
+        s.run(RW + 5)
+        self.assertEqual([m["resolution"] for *_, m in s.resolutions], ["removed"])
+        s.run(40, lambda e: [laptop("O-L44")])
+        self.assertEqual(len(s.alerts), 2)
+        self.assertNotEqual(*s.episode_ids())
+
+    def test_a_laptop_picked_up_by_its_owner_resolves_as_moved(self):
+        s = Scene().run(40, lambda e: [laptop()])
+        s.run(5, lambda e: [laptop(box=shifted(LAPTOP, 300 + int(e * 60)))], lambda e: [SEATED])
+        self.assertEqual([m["resolution"] for *_, m in s.resolutions], ["moved"])
+
+
+class PhoneTests(unittest.TestCase):
+    """15-22, and the brief's phone scenarios A-F."""
+
+    def test_A_a_phone_held_by_a_person_never_alerts(self):
+        def held(e):                            # in the hand: inside the person's box, moving with them
+            dx = int(e * 20) % 600
+            return [phone(box=[1330 + dx, 700, 1370 + dx, 760])]
+        s = Scene().run(600, held, lambda e: [shifted(NEAR_PERSON, int(e * 20) % 600)])
+        self.assertEqual(s.alerts, [])
+
+    def test_B_C_a_phone_put_down_with_its_owner_beside_it_never_alerts(self):
+        s = Scene().run(900, lambda e: [phone()], lambda e: [SEATED])
+        self.assertEqual(s.alerts, [])
+
+    def test_D_a_phone_left_behind_alerts_only_after_the_dwell(self):
+        s = Scene().run(60, lambda e: [phone()], lambda e: [SEATED])      # owner at the desk
+        s.run(31, lambda e: [phone()])                                    # owner gone
+        self.assertEqual(s.alerts, [], "grace + dwell not yet over")
+        s.run(2, lambda e: [phone()])
+        self.assertEqual([m["object_type"] for *_, m in s.alerts], ["cell phone"])
+
+    def test_E_someone_walking_past_an_alerted_phone_changes_nothing(self):
+        s = Scene().run(40, lambda e: [phone()])
+        for _ in range(4):
+            s.run(6, lambda e: [phone()], lambda e: [NEAR_PERSON])
+            s.run(60, lambda e: [phone()])
+        self.assertEqual((len(s.alerts), s.resolutions), (1, []))
+
+    def test_F_the_owner_back_for_the_attendance_period_resolves_it(self):
+        s = Scene().run(40, lambda e: [phone()])
+        s.run(AR + 2, lambda e: [phone()], lambda e: [SEATED])
+        self.assertEqual([m["resolution"] for *_, m in s.resolutions], ["attended"])
+        self.assertEqual(len(s.alerts), 1)
+
+    def test_a_phone_keeps_one_episode_through_fragmentation_and_occlusion(self):
+        def objects(e):                          # small and flickery: seen 3 s of every 5, a new id each time
+            k, phase = int(e // 5), e % 5
+            return [phone(f"O-P{k}")] if phase < 3 else []
+
+        def persons(e):
+            return [SEATED] if 120 <= e < 126 else [FAR_PERSON]             # 6 s with someone in front
+        s = Scene().run(300, objects, persons)
+        self.assertEqual(len(s.alerts), 1)
+        self.assertGreater(len(s.state(s.episode_ids()[0])["track_ids"]), 30)
+
+    def test_a_removed_phone_resolves_and_a_new_one_later_is_a_new_episode(self):
+        s = Scene().run(40, lambda e: [phone()])
+        s.run(RW + 5)
+        self.assertEqual([m["resolution"] for *_, m in s.resolutions], ["removed"])
+        s.run(40, lambda e: [phone("O-P99")])
+        self.assertEqual(len(s.alerts), 2)
+        self.assertNotEqual(*s.episode_ids())
+
+
+class ClassGroupTests(unittest.TestCase):
+    """A laptop, a phone and a bag are different objects even when they lie together."""
+
+    def test_a_phone_lying_on_a_laptop_is_its_own_object(self):
+        on_laptop = [1500, 990, 1550, 1020]
+        s = Scene().run(40, lambda e: [laptop(), phone(box=on_laptop)])
+        self.assertEqual(sorted(m["object_type"] for *_, m in s.alerts), ["cell phone", "laptop"])
+
+    def test_a_laptop_never_continues_a_bags_episode(self):
+        beside = [1340, 920, 1520, 1050]                 # next to BAG, overlapping its tolerance
+        s = Scene().run(40, lambda e: [Obj("O-B1")])
+        s.run(10)                                        # the bag is missed for 10 s ...
+        s.run(40, lambda e: [laptop("O-L2", beside)])    # ... and a laptop shows up next to it
+        self.assertEqual(sorted(m["object_type"] for *_, m in s.alerts), ["backpack", "laptop"])
+        self.assertEqual([len(m["track_ids"]) for *_, m in s.alerts], [1, 1])
+
+    def test_one_object_reported_as_laptop_and_handbag_alerts_once(self):
+        """A laptop bag: the same box under two labels in one frame is one object (_dedupe)."""
+        s = Scene().run(40, lambda e: [laptop("O-L1", LAPTOP), Obj("O-H1", shifted(LAPTOP, 3, 2), 26, "handbag", 0.4)])
+        self.assertEqual(len(s.alerts), 1)
+
+    def test_backpack_and_handbag_still_continue_each_other(self):
+        s = Scene().run(40, lambda e: [Obj("O-1")])
+        s.run(10)
+        s.run(40, lambda e: [Obj("O-2", shifted(BAG, 10), 26, "handbag")])
+        self.assertEqual(len(s.alerts), 1)
+
+    def test_a_phone_handed_a_laptops_track_id_does_not_continue_its_episode(self):
+        """The object tracker is class-agnostic: while the laptop is missed, JeztSort's centroid pass can
+        give its track id to a phone 250 px away (seen on camera_01). That is another object: the laptop's
+        alert is neither moved nor resolved, and the phone starts its own episode."""
+        desk_phone = [1250, 1000, 1300, 1030]
+        s = Scene().run(40, lambda e: [laptop("O-1")])
+        laptop_episode = s.episode_ids()[0]
+        s.run(5, lambda e: [phone("O-1", desk_phone)], lambda e: [SEATED])
+        s.run(20, lambda e: [laptop("O-9")], lambda e: [SEATED])
+        self.assertEqual(s.resolutions, [])
+        self.assertEqual((s.state(laptop_episode)["state"], s.state(laptop_episode)["anchor_bbox"]), (A.ALERTED, LAPTOP))
+        self.assertEqual(s.state(laptop_episode)["track_ids"], ["O-1", "O-9"])
+        phones = [e for e in s.det.episodes() if e["class_name"] == "cell phone"]
+        self.assertEqual([e["track_ids"] for e in phones], [["O-1"]])
+
+    def test_one_object_called_laptop_and_handbag_on_alternate_seconds_alerts_once(self):
+        """The same box, one track, the label flipping (a laptop sleeve; seen on camera_01): one object."""
+        flip = lambda e: [laptop("O-1") if int(e) % 2 else Obj("O-1", LAPTOP, 26, "handbag")]
+        s = Scene().run(60, flip)
+        self.assertEqual(len(s.alerts), 1)
+        self.assertEqual(len(s.det.episodes()), 1)
+
+    def test_an_object_relabelled_after_a_dropout_continues_its_episode(self):
+        s = Scene().run(40, lambda e: [Obj("O-1", LAPTOP, 26, "handbag")])
+        s.run(10)
+        s.run(40, lambda e: [laptop("O-2", shifted(LAPTOP, 4, 2))])
+        self.assertEqual(len(s.alerts), 1)
+        self.assertEqual(s.state(s.episode_ids()[0])["track_ids"], ["O-1", "O-2"])
 
 
 class Sender:

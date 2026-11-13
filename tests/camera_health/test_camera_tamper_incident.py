@@ -30,7 +30,7 @@ from camera_health.manager import (CameraHealthManager, CAMERA_HEALTH_FEATURES, 
                                    FEATURE_OBSTRUCTION, FEATURE_SIGNAL_LOSS,
                                    FEATURE_TAMPER, UMBRELLA_EVENT_TYPE)
 from camera_health.state import Condition, PHASE_READY, PHASE_STARTING  # noqa: E402
-from test_camera_health import (FakeReader, blur, covered_dark, other_scene,  # noqa: E402
+from test_camera_health import (FakeReader, blur, covered_dark, other_scene, real_cover,  # noqa: E402
                                 scene)
 
 CAM = "CAM-R25"
@@ -122,7 +122,7 @@ class ConfigTests(unittest.TestCase):
 
 class RoutingTests(unittest.TestCase):
     def test_01_scene_change_is_camera_tampering(self):
-        h = Harness(); h.prime(); h.feed(other_scene(9), 12)
+        h = Harness(); h.prime(); h.feed(real_cover(9), 12)
         self.assertEqual(h.ct(), [("raise", FEATURE_TAMPER, UMBRELLA_EVENT_TYPE)])
 
     def test_02_obstruction_is_camera_tampering(self):
@@ -170,7 +170,7 @@ class RoutingTests(unittest.TestCase):
 class PersistenceTests(unittest.TestCase):
     def _changed_for(self, seconds):
         h = Harness(); h.prime()
-        h.feed(other_scene(9), seconds); h.feed(scene(3), 20)
+        h.feed(real_cover(9), seconds); h.feed(scene(3), 20)
         return h
 
     def test_06_people_like_change_5s_no_alert(self):
@@ -220,7 +220,7 @@ class CooldownTests(unittest.TestCase):
 class LifecycleTests(unittest.TestCase):
     def test_13_14_15_16_one_alert_no_duplicates_one_recovery_new_alert(self):
         h = Harness(); h.prime()
-        h.feed(other_scene(9), 90)                       # tamper continues 90 s
+        h.feed(real_cover(9), 90)                       # tamper continues 90 s
         self.assertEqual(h.ct(), [("raise", FEATURE_TAMPER, UMBRELLA_EVENT_TYPE)],
                          "one alert, no duplicates while it continues")
         h.feed(scene(3), 20)                             # view back to normal
@@ -228,7 +228,7 @@ class LifecycleTests(unittest.TestCase):
         first_id = h.sent[0]["metadata"]["incident_id"]
         self.assertEqual(h.sent[1]["metadata"]["incident_id"], first_id,
                          "the recovery carries its own incident's id")
-        h.feed(other_scene(9), 12)                       # a later, new tamper
+        h.feed(real_cover(9), 12)                       # a later, new tamper
         self.assertEqual([a for a, _, _ in h.ct()], ["raise", "recover", "raise"], "new alert")
         self.assertNotEqual(h.sent[2]["metadata"]["incident_id"], first_id)
 
@@ -256,7 +256,7 @@ class LifecycleTests(unittest.TestCase):
 
     def test_19_forced_rebaseline_emits_no_recovery(self):
         h = Harness(features={FEATURE_TAMPER}); h.prime()
-        h.feed(other_scene(9), int(D.SCENE_REBASELINE_AFTER_SECONDS) + 60)
+        h.feed(real_cover(9), int(D.SCENE_REBASELINE_AFTER_SECONDS) + 60)
         self.assertEqual([a for a, _, _ in h.ct()], ["raise"])
         self.assertTrue(h.state.tamper.active)
         self.assertEqual(h.state.scene_rebuilds, 0)
@@ -303,7 +303,7 @@ class FrameSizeTests(unittest.TestCase):
 
     def test_22_genuine_tamper_after_resolution_change_detected(self):
         h, softer = self._profile_change(reset=True)
-        h.observe_frame(full_frame(other_scene(9), 800, 600), 12)
+        h.observe_frame(full_frame(real_cover(9), 800, 600), 12)
         self.assertEqual(h.ct(), [("raise", FEATURE_TAMPER, UMBRELLA_EVENT_TYPE)])
 
 

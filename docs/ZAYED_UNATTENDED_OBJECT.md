@@ -1,12 +1,12 @@
 # Unattended objects: one alert per physical episode
 
-2026-10-02.
+2026-10-02. Extended 2026-10-05 to laptops and cell phones (§10).
 
 | Part | Files |
 |---|---|
-| Inference code | `abandoned.py`, `events.py` (`handle_abandoned_event`, `handle_abandoned_resolution`), `zayed_inference.py` (call site) |
+| Inference code | `abandoned.py`, `events.py` (`handle_abandoned_event`, `handle_abandoned_resolution`), `zayed_inference.py` (call site), `detection_routing.py` (which detections reach the tracker and the phone analytic) |
 | Dashboard code | `zayed/unattended.py`, `events_log/api_views.py` (dispatch), `events_log/models.py` (detail line) |
-| Tests | `tests/unit/test_unattended_episodes.py`, `tests/unit/test_abandoned_spot_continuity.py`; dashboard `zayed.test_unattended_episodes` |
+| Tests | `tests/unit/test_unattended_episodes.py`, `tests/unit/test_abandoned_spot_continuity.py`, `tests/unit/test_detection_routing.py`; dashboard `zayed.test_unattended_episodes` |
 | Isolated replay | `tests/unattended/` |
 
 ## 1. The failure
@@ -116,29 +116,28 @@ Environment variables of the inference container. Each value is checked against 
 | `ABANDON_MOVE_HANDLING_SECONDS` | 10 | Both real moves seen (the owner taking a laptop out; the owner collecting the bag) had the owner at the spot. |
 | `ABANDON_ASSOCIATION_DISTANCE` | **0.75** × diagonal | The owner put a bag back 0.52 diagonals from where it was. At 0.5 the old alarm stayed open 88 s beside the new one. Hand-offs from detector dropouts were 0.00–0.01 apart. |
 | `ABANDON_ASSOCIATION_SIZE_RATIO` | 4.0 (area) | partial occlusion halves the box; a phone-sized box does not continue a bag |
-| `ABANDON_ASSOCIATION_STRICT_CLASS` | 0 | one bag was reported as handbag and backpack alternately |
+| `ABANDON_ASSOCIATION_STRICT_CLASS` | 0 = same class **group** (bags together; laptop alone; phone alone) | one bag was reported as handbag and backpack alternately; a laptop or a phone beside a bag is another object (§10) |
 | `ABANDON_MAX_UNSEEN_SECONDS` | 600 | caps an episode hidden behind people |
 | `ABANDON_PREALERT_ATTEND_SECONDS` | 0 | original rule (Dubai tests) |
-| `ABANDON_CLASSES` (old name `ABANDON_CLASS_IDS`) | `backpack,handbag,suitcase` | see below |
+| `ABANDON_CLASSES` (old name `ABANDON_CLASS_IDS`) | `backpack,handbag,suitcase,laptop,cell phone` | see §10 |
 | `ABANDON_MIN_OBSERVED_FRACTION`, `ABANDON_OBJECT_CONFIDENCE` | 0.3, 0.25 | unchanged |
 
-**Classes.**
-- **Supported:** only COCO `backpack` (24), `handbag` (26) and `suitcase` (28, alias `luggage`). These are what the deployed YOLO26-L reports and what the use case was validated with.
-- **Refused:** anything else is refused with a log line and never enabled. The COCO model has **no box/package class**, so that needs a custom-trained detector.
-- **Fallback:** if nothing valid is configured, the validated default applies.
-- **Scope:** classes are global, not per camera.
+**Classes:** see §10. Only supported classes can be enabled; anything else is refused with a log line and never enabled. If nothing valid is configured, the validated default applies. Classes are global, not per camera.
 
 ## 7. Tests
 
 | Suite | Result |
 |---|---|
-| `tests/unit/test_unattended_episodes.py` (new): brief items 1–17, moves (handled / wandering / nudged / relocated), fragments, size, strict class, stalls, retention, class config, event layer | 37/37 |
+| `tests/unit/test_unattended_episodes.py`: brief items 1–17, moves (handled / wandering / nudged / relocated), fragments, size, strict class, stalls, retention, class config, event layer; from 2026-10-05 every supported class, laptop A–H, phone A–F, class groups (§10) | 62/62 (37 on 2026-10-02) |
+| `tests/unit/test_detection_routing.py` (2026-10-05): the phone analytic's input equals the f4e16a9 routing for every combination; phones reach the tracker only as an unattended class | 6/6 |
 | `tests/unit/test_abandoned_spot_continuity.py`: the Dubai suite, test bodies unchanged | 12/12, and 12/12 on the untouched Dubai file |
-| All inference unit suites (`tests/unit/run_unit.sh`) | 116/116 |
-| Resilience, camera-health acceptance | pass, as on production `d32af38` |
-| Mutation checks (`abandoned.py`, `events.py`) | 19/19 caught |
-| Dashboard `zayed.test_unattended_episodes` | 13/13; 11/11 mutants caught |
-| Dashboard full suite / zayed app / `makemigrations --check` | same 93 pre-existing failures as base `5d0ddd3` / 205/205 / no changes |
+| All inference unit suites (`tests/unit/run_unit.sh`) | 147/147 (116 on 2026-10-02) |
+| Resilience, camera-health acceptance | pass, as on deployed `f4e16a9` |
+| Mutation checks (`abandoned.py`, `events.py`, `detection_routing.py`) | 30/30 caught (19 on 2026-10-02) |
+| Dashboard `zayed.test_unattended_episodes` | 16/16 (13 on 2026-10-02); 13/13 mutants caught |
+| Dashboard full suite / zayed app / `makemigrations --check` | same 93 pre-existing failures as base `c7883e2` / 221/221 / no changes |
+
+The 2026-10-05 change edited three existing `ClassConfigTests` because they pinned the old supported set: the refused list no longer contains 67, the fallback is the five classes, and the default test is renamed. Their intent (refuse unsupported classes, never enable them, fall back to the validated default) is unchanged.
 
 ## 8. Replay validation (isolated)
 
@@ -185,7 +184,171 @@ The alarm used never to close.
    - A different bag put in the same place, of similar size, within 120 s of the first one's last sighting, continues the first episode.
    - A second bag set down within 0.75 diagonals by a person, while the first is momentarily undetected, ends the first as `moved`.
 5. **Long dropouts.** A dropout longer than the recovery window, with the spot in view, ends an episode as `removed`. If the bag is detected again afterwards, it raises a new alert. The longest dropout seen was 69.7 s.
-6. **Configuration is global** (environment), not per camera, and only the three COCO bag classes are supported.
+6. **Configuration is global** (environment), not per camera. Only the five COCO classes of §10 are supported.
 7. **Only the alert crop is kept.** There is no separate "first unattended" still, and no "latest" still.
 8. **Recovery rows in the Events list.** A resolution appears as an "Unattended Object Detected" row reading "Resolved: removed after Ns …", as camera-tampering recoveries do.
 9. **Ground truth is a reviewer's reading of the frames,** not operator labels. Replays use one of the three 10 fps frame phases, and each window starts with empty state.
+
+## 10. Supported classes (2026-10-05)
+
+### 10.1 What is supported, and why exactly these
+
+The deployed detector is **YOLO26-L TensorRT FP16** (`/engines/zayed/current/yolo26l.engine`), trained on **COCO, 80 classes**. The class map is read from the engine's own metadata header, not from documentation.
+
+| Class | COCO id | Class group | Dashboard label | Status |
+|---|---|---|---|---|
+| backpack | 24 | bag | "Bag" | supported (since 2026-09) |
+| handbag | 26 | bag | "Bag" | supported (since 2026-09) |
+| suitcase | 28 | bag | "Suitcase" | supported (since 2026-09) |
+| laptop | 63 | laptop | "Laptop" | **supported from 2026-10-05** |
+| cell phone | 67 | phone | "Cell phone" | **supported from 2026-10-05** |
+
+The dashboard shows backpack and handbag as "Bag" by an existing, deliberate rule: the detector flips between the two on one bag. The stored `metadata.object_type` keeps the exact class.
+
+**Not supported:**
+
+| Item | Why |
+|---|---|
+| wallet | Not a COCO class. The model has no wallet output, and no class is mapped to it (`wallet` is refused by `ABANDON_CLASSES`). A wallet may sometimes be detected as "cell phone"; it is then reported as a cell phone, never as a wallet. |
+| generic package, box | Not COCO classes. |
+| generic "personal belongings" | Not a class of any deployed model. Approximating it by enabling other COCO classes (book 73, bottle 39, cup 41, chair 56, …) would alarm on room furniture and on what students normally keep on desks. These are refused, not enabled. |
+
+**Future custom classes** (each needs a detector that outputs it; none is started): wallet; laptop bag as its own class (today it is a "handbag" or "laptop"); package; box; notebook; other valuable item. Options for a wallet, in order of effort:
+
+1. **Fine-tune YOLO26 with an added wallet class.** This means collecting and labelling wallet images (public datasets plus Zayed CCTV at C101/C201/C301 angles), training on the 80 COCO classes plus the new class, re-exporting TensorRT and re-validating every existing analytic (person, bag and phone accuracy must not drop).
+2. **A second, small personal-belongings detector**, run only on cameras with unattended-object armed. It costs extra GPU time per frame and must be measured against the 10 fps per camera budget.
+3. **Another validated model**, for example an open-vocabulary detector. It needs a latency and false-alarm validation on these cameras before any use.
+
+### 10.2 The same lifecycle for every class
+
+Laptops and phones go through the unchanged episode lifecycle of §4: OBSERVED → CANDIDATE → UNATTENDED → ALERTED → RESOLVED (`removed`, `moved`, `attended`). They use the same dwell (30 s), owner grace (2 s), proximity radius (12 % of the frame diagonal), recovery window (120 s), attended resolution (300 s), object confidence floor (0.25), one alert per episode, one evidence crop per episode, and the same dashboard alarm folding by `(camera, episode_id)`.
+
+There are **no per-class thresholds**: the replay (§10.6) showed no need for one.
+
+A phone in a hand lies inside its holder's person box, at distance 0, so it is always attended. A phone on a desk in front of a seated student is within the proximity radius. The phone alerts only when nobody has been near it for the dwell.
+
+### 10.3 MOBILE_PHONE_DETECTED and UNATTENDED_OBJECT_DETECTED (cell phone) are different use cases
+
+| | `MOBILE_PHONE_DETECTED` (`phone_use.py`) | `UNATTENDED_OBJECT_DETECTED`, `object_type = "cell phone"` (`abandoned.py`) |
+|---|---|---|
+| Question | Is a person **using** a phone? | Has a phone been **left** with nobody near it? |
+| Input | Raw phone boxes ≥ `PHONE_CONFIDENCE` 0.30, plus person tracks | Tracked phone boxes ≥ 0.25 (on cameras with `abandoned_object` armed), plus person boxes |
+| Fires when | A phone box stays attached to a person (centre in the upper 80 % of the person box) for ≥ 5 s within 15 s, over ≥ 6 frames; one event per person per 300 s | A phone has rested with nobody within the radius for 30 s; one alert per physical episode |
+| A phone in a hand | the event | never an alert (attended) |
+| Camera flag | `mobile_phone_detection` | `abandoned_object` |
+| Changed on 2026-10-05 | **No.** The same boxes, at the same threshold, reach it (pinned by `test_detection_routing.test_the_phone_analytic_receives_exactly_what_it_did_before`) | Phones added as a class |
+
+### 10.4 The routing change (`detection_routing.py`)
+
+Before, a phone ≥ 0.30 on a phone-armed camera went **only** to `phone_use`: the tracker, and therefore the unattended analytic, never saw it. Adding 67 to the allowlist alone would have been a silent half-feature. `detection_routing.route()` is now the one rule for the live loop and the replay:
+
+- A phone goes to `phone_use` exactly as before.
+- **Additionally**, it goes to the tracker, but only when "cell phone" is an unattended class and `abandoned_object` is armed on that camera.
+- With either condition off, a phone is routed exactly as before.
+- Every other class routes exactly as before.
+
+YOLO inference itself is unchanged: the predict floor was already 0.25 on unattended-armed cameras.
+
+### 10.5 One physical object, one episode, across classes
+
+With the extra classes, three rules decide whether two detections are one object:
+
+| Rule | Where | Across class groups? |
+|---|---|---|
+| Two near-identical boxes in **one frame** (IoU ≥ 0.5) are one object | `_dedupe` | **Yes.** A laptop bag reported as "laptop" and "handbag" in the same frame alerts once. |
+| A detection inside an object already seen this frame is a fragment of it | the fragment rule in `_associate` | **No.** A phone lying on a laptop is a second object. |
+| A detection continues an episode: through its track id, or as a nearby unseen episode of similar size within the recovery window | `_associate`, `_same_object_class` | **Only if the box coincides** with the episode's latest box (IoU ≥ 0.5). This covers one object labelled differently on different frames. Bags continue each other as before. |
+
+The track-id rule was added after the replay showed that the object tracker is class-agnostic:
+- JeztSort's second matching pass is by centroid distance (≤ 150 px).
+- While a laptop was missed, a phone held 140 px away was handed the laptop's track id (camera_01, `abandoned_object_04`, t = 22.3 s).
+- Without the rule, the phone would have continued (and could have "moved") the laptop's episode.
+- The same replay showed one laptop shoulder bag called "handbag" and "laptop" on alternate frames, on an identical box (20 flips in 90 s). The coinciding-box exception keeps that as one episode.
+
+For bags only (the deployed configuration), these rules are exactly the old ones: every bag class is in one group.
+
+### 10.6 Replay (isolated, 2026-10-05)
+
+**Footage.** 76 clips, 5.15 h in all, over three cameras. The laptop and phone content was verified on frames before any claim was made.
+- 57 POC clips of 50–215 s (`Ai_inferencing/poc_app/clips*/{abandoned_object,phone_use}`):
+  - laptops (open and closed) and bags left on desks at C101 and C201;
+  - people holding and using phones;
+  - phones lying on desks.
+- 19 recordings of 40 s to 67 min (`zayed_ai_inferencing/zayed_test_recordings/`, `zayed_test_recordings/2026-09-12`, `2026-09-28`). These include a student working at a laptop at C101 (09-12), a 29-minute C201 session full of phone use (09-12), and bags carried through the rooms (09-26).
+- There is no left-suitcase scene.
+
+**Method.**
+1. **Stage 1** (GPU, `--network none`). Every clip was run twice on the same frames: with the new routing, and with the f4e16a9 routing (`dump_unattended_inputs.py --separate --legacy-routing`).
+2. **Stage 2** (CPU, `batch_eval.py`). The new `abandoned.py` ran on the new dumps, and the deployed f4e16a9 `abandoned.py` on the legacy dumps.
+
+Each clip starts from empty state. An object already in place therefore alerts 32 s into the clip, and successive POC clips of one desk each alert once.
+
+| Class | Detections | Raw track ids | Episodes | Reached UNATTENDED | Alerts | Physical objects alerted | Duplicate alerts | False alerts (frames reviewed) | Resolutions | Track ids per alerted episode |
+|---|---|---|---|---|---|---|---|---|---|---|
+| laptop | 68,266 | 394 | 105 | 23 | **13** | 3 (C101 desk in 11 POC clips; C101 09-12; C201) | **0** | **0** | 1 `attended`: the owner sat back down at it (09-12, alert 13:30:42, resolved 21 min later) | 1–6 |
+| cell phone | 18,234 | 397 | 326 | 10 | **2** | 2 | **0** | **0**: one phone on a desk; one small dark folding item, a wallet or a phone in a folio case, reported as "Cell phone" | none inside the clips | 1 |
+| backpack | 22,623 | 353 | 85 | 28 | 11 | – | 0 | as f4e16a9 | 1 `moved`, as f4e16a9 | 1–8 |
+| handbag | 15,664 | 316 | 105 | 20 | 9 | – | 0 | as f4e16a9 | – | 1–7 |
+| suitcase | 92 | 22 | 3 | 0 | 0 | – | – | – | – | – |
+
+- **Phones in hands never alerted.** 11,134 phone boxes were attached to a person (the `MOBILE_PHONE_DETECTED` input). Of the 326 phone episodes, 10 had nobody near for the 2 s grace, and 2 stayed unattended for the 30 s dwell: both were items left on an empty desk.
+- **Missed phone.** A black phone lying face-down behind the C101 laptop (15:52–16:06) was never detected as "cell phone": 0 detections in about 3,400 frames. It raised no alert. This is a limit of the detector's recall, not of the episode logic.
+- **Bags unchanged.** In all 76 clips, the bag alerts and resolutions of the new code on the new routing equal those of f4e16a9 on the old routing (time ±2 s, class group, resolution): 20 alerts and 1 `moved` each.
+- **Phone analytic input unchanged.** Over 184,612 frames:
+  - The `phone_use` input is identical except for 48 frames.
+  - In 36 of these the confidence differs by ≤ 0.011.
+  - In 12, a box at 0.300–0.324 moves by 1 px or crosses the 0.30 floor, in both directions.
+  - Two runs of the same legacy code on the same clips differ in the same way. This is TensorRT FP16 run-to-run variation, not the routing change.
+- **Track handovers across classes.** Over the 37 C101 POC and 09-30 clips:
+  - At the committed `TRACK_DIST_THRESH` 150 px, 24 track-class changes were a jump to another object.
+  - At 250 px (an uncommitted edit in the production checkout), there were 69.
+  - The alerts were the same with and without the §10.5 rule at both settings. The rule keeps each episode to one object.
+- **No per-class threshold is needed.**
+  - Phone boxes: short side median 62 px; 17 of 18,234 below the 24 px evidence minimum.
+  - Laptop boxes: short side median 114 px.
+  - Below 0.30 confidence: phones 13 %, handbags 10 %, laptops 9 %, backpacks 7 %.
+  - No false alert was found at the shared 0.25 floor.
+
+**Performance** (the same 184,612 frames per run, both runs concurrently on one GPU):
+
+| Camera | predict ms p50 / p95, new vs f4e16a9 | tracker ms p50 / p95 | `update()` µs p50 / p95 | prediction failures |
+|---|---|---|---|---|
+| camera_01 | 11.01 / 12.38 vs 11.04 / 12.42 | 0.58 / 1.04 vs 0.58 / 1.02 | 6.0 / 13.0 vs 1.0 / 4.8 | 0 / 0 |
+| camera_02 | 10.97 / 12.32 vs 10.97 / 12.29 | 0.59 / 1.03 vs 0.60 / 1.04 | 3.8 / 9.7 vs 1.7 / 4.4 | 0 / 0 |
+| camera_03 | 10.90 / 12.23 vs 10.91 / 12.25 | 0.54 / 1.00 vs 0.52 / 0.97 | 2.6 / 28.6 vs 1.0 / 7.6 | 0 / 0 |
+
+- YOLO inference is unchanged: the same engine, input size and predict floor, so the GPU load is the same. During the camera_01 run, each replay container used about 190 % CPU (mostly H.264 decoding), 1.31 GiB of RAM and 1,221 MiB of GPU memory, the same for both.
+- The added per-frame cost is under 0.1 ms per camera against a 100 ms budget at 10 fps. The production figure of 29.7 fps in total (about 10 per camera, 0 failures) is not expected to change. It was not re-measured live, because production was not restarted.
+
+### 10.7 Limitations specific to laptops and phones
+
+1. **Detector recall.** A phone lying face-down or edge-on, or partly hidden by a laptop lid, may never be detected, and then it never alerts (§10.6).
+2. **Class confusion.**
+   - A wallet, a phone in a folio case or a power bank can be detected as "cell phone".
+   - A laptop sleeve can be detected as "laptop" or "handbag". It still raises one alert (§10.5), named by its majority class.
+3. **A phone on a desk counts as attended** while anyone is within the proximity radius (about 389 px at C101), the same rule as for bags.
+4. **Phone evidence crops are small:** a median short side of 62 px before padding.
+
+### 10.7 Re-validation at the production settings (2026-10-09) and deployment
+
+§10.6 ran at detector size 640 with its headline numbers at `TRACK_DIST_THRESH` 150. Production runs **960** (`DETECTOR_IMGSZ`, since 2026-10-06) and **250** (committed in 2f5fe30). The replay was repeated at exactly those settings before deployment. `tests/unattended/` now passes `DETECTOR_IMGSZ` and `TRACK_DIST_THRESH` through instead of a hardcoded 640.
+
+**Footage.** The 74 of §10.6's 76 clips that still exist (two short 09-30 camera_01 clips were deleted): 43 camera_01, 20 camera_02, 11 camera_03. That is 181,706 inferred frames per routing, 0 prediction failures. Each clip was run with the new routing and with the deployed (f4e16a9) routing on the same frames, then evaluated with the new and the deployed `abandoned.py` respectively.
+
+| Check | Result |
+|---|---|
+| Bag alerts and resolutions, new vs deployed | **identical in 74/74 clips** (27 alerts each; ±2 s, same resolution) |
+| Possible duplicate alerts | **0** on all three cameras |
+| `phone_use` input (`MOBILE_PHONE_DETECTED`) | 181,651 / 181,706 frames identical; 55 differ by TensorRT FP16 run-to-run noise (48 in the third decimal of confidence, the rest a 1 px box or a box at 0.302 crossing 0.30) - 2 boxes in 40,118 |
+| Laptop | **18 alerts, all genuine**, on 6 physical laptops: the C101 desk laptop (13 overlapping POC clips), the 09-12 lesson laptop and its laptop sleeve (both `attended` when the owner returned), a C101 desk laptop, a C101 back-row laptop about 13 m away (new at 960, confidence median 0.38), and a C201 desk laptop |
+| Cell phone | **10 alerts on 4 physical objects**: 3 genuine phones left on desks (the 09-12 lesson phone, 31 track ids, one alert, `attended`; two POC desks) and **1 key fob labelled "cell phone"** beside the C101 laptop (7 clips) |
+| Phones held or in use | 0 alerts. 587 phone episodes formed, 26 became unattended, 10 alerted - every one on a desk with nobody near. The 29-minute C201 phone-use lesson: 0 alerts |
+| Negative windows | 0 laptop/phone alerts on camera_03 (all 11 clips), the 09-30 C101 recording (100 min), the 09-26 recordings and the C201 lesson recordings |
+| Tracker-id changes | one alert per episode up to 31 track ids (phone) and 13 (laptop) |
+| Cost | tracker update p50 0.87 -> 0.94 ms per frame; `abandoned.update` p50 2.3 -> 11.8 µs |
+
+**The key fob, and why there is no phone-specific threshold.** The fob is genuinely unattended, but it is not a phone. Its detections are "cell phone" at 0.25-0.40 (median 0.258-0.309 per clip). A phone-only observation floor at `phone_use.PHONE_CONFIDENCE` (0.30) was tried on the same dumps and rejected: it removed the fob in 4 of 7 clips, still alerted in 3, and lost the genuine phone beside the laptop in `phone_use_07`, because the medians overlap (genuine 09-12 phone 0.314). Peak confidence happens to separate them here (fob <= 0.40, phones 0.62-0.86), but one mislabelled object against three phones is not evidence for a rule. The class is shipped with the limitation stated: **an unattended "Cell phone" can be another small dark personal item.**
+
+**False negatives seen.** A black phone lying face-down behind the C101 laptop was never detected at 960 (0 of 688 frames), nor at 640. A phone beside the back-row laptop was not alerted.
+
+**Deployed 2026-10-09** with `ABANDON_CLASSES=backpack,handbag,suitcase,laptop,cell phone`. **Rollback without a code change:** set `ABANDON_CLASSES` to `backpack,handbag,suitcase` and recreate the container. Phones then route only to `phone_use` and laptops are not tracked - exactly the f4e16a9 inputs (pinned by `test_detection_routing`).

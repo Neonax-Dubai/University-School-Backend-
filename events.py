@@ -103,6 +103,11 @@ COOLDOWN_SECONDS = float(os.getenv("EVENT_COOLDOWN_SECONDS", "2.0"))
 # every intrusion/perimeter_breach/loitering event makes the dashboard raise an
 # ALARM, so a 2s cooldown would put 30 alarms in the operator's queue for one
 # person standing still for a minute.
+#: Evidence type for the exact downscaled frame a camera-health detector judged.
+#: Deliberately NOT "crop" or "snapshot": it is 320x180 greyscale, it shows no subject,
+#: and Event.still_evidence must never pick it up as a card image (ZAYED 2026-10-12).
+HEALTH_SAMPLE_KIND = "health_sample"
+
 ZONE_COOLDOWN_SECONDS = float(os.getenv("ZONE_EVENT_COOLDOWN_SECONDS", "30.0"))
 
 # ENTRY-triggered zone events need a different kind of window from presence
@@ -721,10 +726,18 @@ class EventPipeline:
         frame=None,
         contributors=None,
         scope=None,
+        diagnostic=None,
     ):
         """
         Emit an event that belongs to a camera/zone rather than to one track -
         crowd_detected today, camera health events later.
+
+        `diagnostic` is (jpeg, width, height): the exact downscaled frame a detector made
+        its decision on, stored as evidence type "health_sample" rather than a crop
+        (ZAYED 2026-10-12). It is not a picture of a subject and must never be shown as
+        one; it exists so a raise can be checked against what the detector actually saw.
+        Storing it must never cost the event: any failure falls through to the ordinary
+        send below.
         """
         if not self.debouncer.allow(
             camera_id, "", event_type, scope, ZONE_COOLDOWN_SECONDS
@@ -778,6 +791,27 @@ class EventPipeline:
                 return "sent"
 
             self.evidence.note_skipped()
+
+        # The judged frame, when a detector handed one over. Separate from the crop branch
+        # above: there is no bbox to cut and no subject to draw, and the image goes in under
+        # its own evidence type.
+        if diagnostic is not None and self.evidence is not None:
+            try:
+                jpeg, sample_width, sample_height = diagnostic
+                if jpeg:
+                    # Return unconditionally, exactly as the crop branch does: once submit()
+                    # accepts the item the uploader owns the event and sends it either way -
+                    # on a saturated queue it sends immediately and returns False. Treating
+                    # False as "not sent" here would deliver the event TWICE.
+                    self.evidence.submit(
+                        jpeg, sample_width, sample_height, event, True, camera_id,
+                        f"health{scope}" if scope else "health", observed_at,
+                        kind=HEALTH_SAMPLE_KIND,
+                    )
+                    return "sent"
+            except Exception as exc:                              # noqa: BLE001
+                # A diagnostic is a convenience; the event is not.
+                print(f"[EVENT] {camera_id} health sample not stored: {type(exc).__name__}: {exc}")
 
         self.sender.submit(event, notable=True)
 

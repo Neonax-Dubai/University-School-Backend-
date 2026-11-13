@@ -32,6 +32,12 @@ PHONE_WINDOW_SECONDS = float(os.getenv("PHONE_WINDOW_SECONDS", "15"))
 PHONE_MIN_HITS = int(os.getenv("PHONE_MIN_HITS", "6"))
 PHONE_COOLDOWN_SECONDS = float(os.getenv("PHONE_COOLDOWN_SECONDS", "300"))
 PHONE_REGION_TOP_FRACTION = float(os.getenv("PHONE_REGION_TOP_FRACTION", "0.80"))
+#: ZAYED 2026-11-13: the cooldown is also held by POSITION. In C102 the tracker re-identified the
+#: same seated student every few minutes: 1,980 events in two days came from 1,491 track ids, a
+#: median of ONE event per id, so the per-track cooldown never bound. A new finding whose box
+#: overlaps (IoU >= this) a finding raised on the same camera within PHONE_COOLDOWN_SECONDS is the
+#: same seat, not a new person. Replayed on those 1,980 events: 1,310 remain. 0 disables.
+PHONE_SEAT_IOU = float(os.getenv("PHONE_SEAT_IOU", "0.30"))
 TRACK_FORGET_SECONDS = 60.0
 
 
@@ -49,6 +55,14 @@ def attach(phone_box, person_boxes):
         if best_area is None or area < best_area:
             best, best_area = i, area
     return best
+
+
+def iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    total = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / total if total > 0 else 0.0
 
 
 def union(a, b):
@@ -87,6 +101,8 @@ class PhoneUseDetector:
         self._hits = {}          # (camera, track) -> deque[(t, confidence, phone_box)]
         self._last_seen = {}     # (camera, track) -> t
         self._last_event = {}    # (camera, track) -> t
+        self._recent = {}        # camera -> [(t, bbox)] findings raised within the cooldown
+        self.seat_suppressed = 0
         self.raised = 0
         self.attached = 0
 
@@ -134,9 +150,19 @@ class PhoneUseDetector:
             last = self._last_event.get(key)
             if last is not None and now - last < PHONE_COOLDOWN_SECONDS:
                 continue
-            self._last_event[key] = now
             best = max(hits, key=lambda h: h[1])
-            findings.append(PhoneFinding(camera_id, track.track_id, union(track.bbox, best[2]), best[2],
+            bbox = union(track.bbox, best[2])
+            recent = [r for r in self._recent.get(camera_id, ()) if now - r[0] < PHONE_COOLDOWN_SECONDS]
+            self._recent[camera_id] = recent
+            if PHONE_SEAT_IOU > 0 and any(iou(bbox, rb) >= PHONE_SEAT_IOU for _t, rb in recent):
+                # the same seat under a new track id: hold it like the track's own cooldown
+                self._last_event[key] = now
+                self.seat_suppressed += 1
+                hits.clear()
+                continue
+            self._last_event[key] = now
+            recent.append((now, bbox))
+            findings.append(PhoneFinding(camera_id, track.track_id, bbox, best[2],
                                          now, len(hits), span, best[1]))
             hits.clear()
             self.raised += 1
@@ -146,6 +172,7 @@ class PhoneUseDetector:
         for store in (self._hits, self._last_seen, self._last_event):
             for key in [k for k in store if k[0] == camera_id]:
                 del store[key]
+        self._recent.pop(camera_id, None)
 
     def prune(self, now):
         gone = [k for k, t in self._last_seen.items() if now - t > TRACK_FORGET_SECONDS]
@@ -154,7 +181,11 @@ class PhoneUseDetector:
             self._hits.pop(key, None)
         for key in [k for k, t in self._last_event.items() if now - t > PHONE_COOLDOWN_SECONDS]:
             del self._last_event[key]
+        for camera in list(self._recent):
+            self._recent[camera] = [r for r in self._recent[camera] if now - r[0] < PHONE_COOLDOWN_SECONDS]
+            if not self._recent[camera]:
+                del self._recent[camera]
 
     def stats(self):
         return {"cameras": sorted(self._enabled), "attached": self.attached, "raised": self.raised,
-                "tracked": len(self._hits)}
+                "seat_suppressed": self.seat_suppressed, "tracked": len(self._hits)}

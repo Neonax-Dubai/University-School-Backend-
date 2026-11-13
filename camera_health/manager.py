@@ -283,7 +283,7 @@ class CameraHealthManager:
                                                   D.OBSTRUCTION_COOLDOWN_SECONDS, detail)
                 results[FEATURE_OBSTRUCTION] = (action, detail)
                 if action:
-                    announcements.append((camera_id, FEATURE_OBSTRUCTION, action, detail, ts))
+                    announcements.append((camera_id, FEATURE_OBSTRUCTION, action, detail, ts, gray))
 
             # Scene change before defocus: a lighting transition re-learns the
             # sharpness baseline too, and must do so before this sample is judged.
@@ -302,7 +302,7 @@ class CameraHealthManager:
                                                  D.TAMPER_COOLDOWN_SECONDS, detail)
                     results[FEATURE_TAMPER] = (action, detail)
                     if action:
-                        announcements.append((camera_id, FEATURE_TAMPER, action, detail, ts))
+                        announcements.append((camera_id, FEATURE_TAMPER, action, detail, ts, gray))
 
             bad, detail = D.defocus_state(state, sharp, obstructed)
             if FEATURE_DEFOCUS in features and bad is not None:
@@ -310,7 +310,7 @@ class CameraHealthManager:
                                               D.DEFOCUS_COOLDOWN_SECONDS, detail)
                 results[FEATURE_DEFOCUS] = (action, detail)
                 if action:
-                    announcements.append((camera_id, FEATURE_DEFOCUS, action, detail, ts))
+                    announcements.append((camera_id, FEATURE_DEFOCUS, action, detail, ts, gray))
             self.samples_processed += 1
 
         for message in messages:
@@ -320,8 +320,17 @@ class CameraHealthManager:
         return results
 
     # ------------------------------------------------------------ incidents / events
-    def _announce(self, camera_id, feature, action, detail, at):
-        """One detector transition. Folds tampering transitions into incidents."""
+    def _announce(self, camera_id, feature, action, detail, at, sample=None):
+        """One detector transition. Folds tampering transitions into incidents.
+
+        `sample` is the 320x180 greyscale frame THIS decision was made on - the array the
+        detectors were handed, not a frame fetched afterwards. It is forwarded only for a
+        raise (ZAYED 2026-10-12): on 2026-10-12 a camera_01 raise recorded distance 1.0584,
+        brightness ratio 1.545 and sharpness 0.436 at a moment the NVR recorded as a static
+        room (distance 0.009-0.019 on replay). Nothing in the pipeline kept the picture the
+        detector actually judged, so there was no way to tell a corrupt frame from a real
+        scene change. Keeping one frame per raise closes that.
+        """
         detail = dict(detail or {})
         with self._lock:
             self.transitions += 1
@@ -360,7 +369,8 @@ class CameraHealthManager:
                     emit = ("recover", self._metadata(incident, at))
                     del self._incidents[camera_id]
         if emit is not None:
-            self._emit(camera_id, emit[0], emit[1], at)
+            self._emit(camera_id, emit[0], emit[1], at,
+                       sample if emit[0] == "raise" else None)
         return emit[0] if emit else None
 
     @staticmethod
@@ -382,7 +392,7 @@ class CameraHealthManager:
             meta["duration_seconds"] = round(recovered_at - incident["opened_at"], 3)
         return meta
 
-    def _emit(self, camera_id, action, metadata, at):
+    def _emit(self, camera_id, action, metadata, at, sample=None):
         state = self._states.get(camera_id)
         width, height = (state.frame_size if state is not None and state.frame_size else (None, None))
         if self.shadow:
@@ -394,7 +404,8 @@ class CameraHealthManager:
             return
         try:
             self.event_sink(camera_id=camera_id, event_type=UMBRELLA_EVENT_TYPE, timestamp=at,
-                            metadata=metadata, action=action, frame_width=width, frame_height=height)
+                            metadata=metadata, action=action, frame_width=width, frame_height=height,
+                            sample=sample)
             self.events_emitted += 1
         except Exception as exc:                                  # noqa: BLE001
             self.sink_errors += 1

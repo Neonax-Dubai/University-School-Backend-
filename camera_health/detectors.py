@@ -111,6 +111,17 @@ LIGHTING_MIN_BRIGHTNESS_RATIO = _env_float("CAMERA_HEALTH_LIGHTING_MIN_BRIGHTNES
 LIGHTING_SHARPNESS_COLLAPSE_RATIO = _env_float(
     "CAMERA_HEALTH_LIGHTING_SHARPNESS_COLLAPSE_RATIO", 0.35)
 
+# ZAYED 2026-11-13: scene change alone is not Camera Tampering. Measured on every false raise of
+# 2026-11-10..12 (the exact frame the detector judged, all three cameras): people seated or
+# walking close to the high-mounted cameras and room-lighting changes moved the scene signature
+# past TAMPER_DISTANCE and held it there for minutes, while the image stayed SHARP - sharpness
+# 0.49x and up of the clean view, median 0.99x. The genuine lens cover of 2026-09-30 collapsed it
+# to 0.04-0.27x. Requiring the collapse (below LIGHTING_SHARPNESS_COLLAPSE_RATIO) removed every
+# measured false raise and kept the genuine one. Cost: a camera turned to face elsewhere (a sharp,
+# different view) no longer raises as scene-change tampering. A uniform cover is still caught by
+# the obstruction detector, which this does not touch. Set the env to 0 to restore the old rule.
+TAMPER_REQUIRE_SOFT_IMAGE = os.getenv("CAMERA_HEALTH_TAMPER_REQUIRE_SOFT_IMAGE", "1") not in ("0", "false", "False")
+
 
 def scene_signature(gray):
     return metrics.signature(metrics.ensure_sample(gray))
@@ -337,4 +348,16 @@ def tamper_state(state, gray, now, obstructed):
         adapted = (1.0 - SCENE_ADAPT_ALPHA) * state.scene_baseline + SCENE_ADAPT_ALPHA * sig
         adapted -= adapted.mean()
         state.scene_baseline = (adapted / max(float(np.linalg.norm(adapted)), 1e-6)).astype(np.float32)
+    if (bad and TAMPER_REQUIRE_SOFT_IMAGE and state.sharpness_baseline is not None
+            and state.sharpness_baseline > 1e-9):
+        # ZAYED 2026-11-13: a changed scene is Camera Tampering only if the image has also gone
+        # soft. See TAMPER_REQUIRE_SOFT_IMAGE. None, not False: the candidate of a genuine cover
+        # must survive a transitional in-focus sample, exactly as for structure_intact above.
+        # With no sharpness baseline the gate does not apply and the old rule stands: a safety
+        # detector must never be switched off by missing data.
+        sharp_ok, sharp_check = lighting_sharpness_credible(state, gray)
+        detail.update(sharp_check)
+        if sharp_ok:
+            detail["in_focus_rejected"] = "scene changed but the image is in focus"
+            return None, detail
     return bad, detail

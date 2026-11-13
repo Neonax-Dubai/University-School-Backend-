@@ -67,7 +67,7 @@ def _raise_a_tamper():
     h = Harness()
     baseline = scene(1)
     h.feed(baseline, D.BASELINE_SAMPLES + 6)
-    covered = scene(99)
+    covered = __import__('cv2').GaussianBlur(scene(99), (31, 31), 0)   # a real cover is soft
     h.feed(covered, int(D.TAMPER_SECONDS) + 4)
     return h, baseline, covered
 
@@ -87,7 +87,7 @@ def test_the_frame_is_not_refetched_after_the_decision():
     """It must be the array handed to tamper_state, identity included."""
     h = Harness()
     h.feed(scene(1), D.BASELINE_SAMPLES + 6)
-    covered = scene(99)
+    covered = __import__('cv2').GaussianBlur(scene(99), (31, 31), 0)   # a real cover is soft
     seen = []
     real = D.tamper_state
 

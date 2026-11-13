@@ -47,6 +47,14 @@ def other_scene(seed=0, w=M.SAMPLE_WIDTH, h=M.SAMPLE_HEIGHT):
     return np.ascontiguousarray(np.rot90(scene(seed, w=h, h=w)))
 
 
+def real_cover(seed=0):
+    """What a real lens cover looks like to the detector: a changed view that has also gone
+    SOFT. ZAYED 2026-11-13: since TAMPER_REQUIRE_SOFT_IMAGE a sharp view swap (other_scene)
+    models a camera turned to face elsewhere, which no longer raises; the genuine 2026-09-30
+    hand-on-lens collapsed sharpness to 0.04-0.27x, which this reproduces."""
+    return blur(other_scene(seed), 31)
+
+
 def dim(img, gain):
     return np.clip(img.astype(np.float32) * gain, 0, 255).astype(np.uint8)
 
@@ -319,22 +327,37 @@ class TamperTests(unittest.TestCase):
     def test_persistent_scene_change_raises(self):
         m = manager(features=[FEATURE_TAMPER])
         t = prime(m, "CAM-A", scene(23), 0.0)
-        feed(m, "CAM-A", other_scene(99), t, 20)
+        feed(m, "CAM-A", real_cover(99), t, 20)
         st = m._states["CAM-A"]
         self.assertTrue(st.tamper.active)
         self.assertEqual(st.tamper.raises, 1)
 
-    def test_camera_rotated_raises(self):
+    def test_camera_rotated_no_longer_raises_while_in_focus(self):
+        """ZAYED 2026-11-13: a sharp, different view is not scene-change tampering any more -
+        the deliberate cost of TAMPER_REQUIRE_SOFT_IMAGE."""
         m = manager(features=[FEATURE_TAMPER])
         base = scene(24)
         t = prime(m, "CAM-A", base, 0.0)
         feed(m, "CAM-A", np.roll(base, 160, axis=1), t, 20)
-        self.assertTrue(m._states["CAM-A"].tamper.active)
+        self.assertFalse(m._states["CAM-A"].tamper.active)
+
+    def test_camera_rotated_raises_with_the_gate_switched_off(self):
+        """CAMERA_HEALTH_TAMPER_REQUIRE_SOFT_IMAGE=0 restores the old rule exactly."""
+        saved = D.TAMPER_REQUIRE_SOFT_IMAGE
+        D.TAMPER_REQUIRE_SOFT_IMAGE = False
+        try:
+            m = manager(features=[FEATURE_TAMPER])
+            base = scene(24)
+            t = prime(m, "CAM-A", base, 0.0)
+            feed(m, "CAM-A", np.roll(base, 160, axis=1), t, 20)
+            self.assertTrue(m._states["CAM-A"].tamper.active)
+        finally:
+            D.TAMPER_REQUIRE_SOFT_IMAGE = saved
 
     def test_temporary_change_does_not_raise(self):
         m = manager(features=[FEATURE_TAMPER])
         t = prime(m, "CAM-A", scene(25), 0.0)
-        feed(m, "CAM-A", other_scene(98), t, 5)             # 5s < 10s persistence
+        feed(m, "CAM-A", real_cover(98), t, 5)             # 5s < 10s persistence
         self.assertFalse(m._states["CAM-A"].tamper.active)
 
     def test_lighting_change_is_not_tamper(self):
@@ -347,7 +370,7 @@ class TamperTests(unittest.TestCase):
     def test_return_to_baseline_recovers(self):
         m = manager(features=[FEATURE_TAMPER])
         t = prime(m, "CAM-A", scene(27), 0.0)
-        feed(m, "CAM-A", other_scene(97), t, 20)
+        feed(m, "CAM-A", real_cover(97), t, 20)
         st = m._states["CAM-A"]
         self.assertTrue(st.tamper.active)
         # A recovery now waits the SAME window as the raise (Condition
@@ -362,7 +385,7 @@ class TamperTests(unittest.TestCase):
         m = manager(features=[FEATURE_TAMPER])
         t = prime(m, "CAM-A", scene(28), 0.0)
         before = m._states["CAM-A"].scene_baseline.copy()
-        feed(m, "CAM-A", other_scene(96), t, 60)
+        feed(m, "CAM-A", real_cover(96), t, 60)
         after = m._states["CAM-A"].scene_baseline
         self.assertTrue(np.allclose(before, after, atol=1e-6),
                         "baseline must not drift toward the tampered scene")
@@ -586,7 +609,7 @@ class TamperBaselineLifecycleTests(unittest.TestCase):
 
     def test_no_tamper_decision_before_baseline_is_valid(self):
         m = manager(features=[FEATURE_TAMPER])
-        alt = other_scene(65)
+        alt = real_cover(65)
         feed(m, "CAM-A", alt, 0.0, 3, features={FEATURE_TAMPER})
         st = m._states["CAM-A"]
         self.assertFalse(st.scene_baseline_valid())
@@ -614,7 +637,7 @@ class TamperBaselineLifecycleTests(unittest.TestCase):
         m = manager(features=[FEATURE_TAMPER])
         base = scene(68)
         t = prime(m, "CAM-A", base, 0.0, features={FEATURE_TAMPER})
-        feed(m, "CAM-A", np.roll(base, 160, axis=1), t, 20, features={FEATURE_TAMPER})
+        feed(m, "CAM-A", real_cover(68), t, 20, features={FEATURE_TAMPER})
         st = m._states["CAM-A"]
         self.assertTrue(st.tamper.active)
         self.assertEqual(st.tamper.raises, 1)
@@ -624,7 +647,7 @@ class TamperBaselineLifecycleTests(unittest.TestCase):
         base = scene(69)
         t = prime(m, "CAM-A", base, 0.0, features={FEATURE_TAMPER})
         before = m._states["CAM-A"].scene_baseline.copy()
-        feed(m, "CAM-A", other_scene(70), t, 120, features={FEATURE_TAMPER})
+        feed(m, "CAM-A", real_cover(70), t, 120, features={FEATURE_TAMPER})
         st = m._states["CAM-A"]
         self.assertTrue(st.tamper.active)
         self.assertTrue(np.allclose(before, st.scene_baseline, atol=1e-6),
@@ -646,7 +669,7 @@ class TamperBaselineLifecycleTests(unittest.TestCase):
         t = prime(m, "CAM-A", base, 0.0, features={FEATURE_TAMPER})
         st = m._states["CAM-A"]
         before = st.scene_baseline.copy()
-        changed = other_scene(72)
+        changed = real_cover(72)
         seen = feed(m, "CAM-A", changed, t, int(D.SCENE_REBASELINE_AFTER_SECONDS) + 70,
                     features={FEATURE_TAMPER})
         self.assertEqual([a for _, f, a in seen], ["raise"], "one raise, no forced recovery")
@@ -663,7 +686,7 @@ class TamperBaselineLifecycleTests(unittest.TestCase):
         m = manager(features=[FEATURE_TAMPER])
         base = scene(73)
         t = prime(m, "CAM-A", base, 0.0, features={FEATURE_TAMPER})
-        feed(m, "CAM-A", other_scene(74), t, 20, features={FEATURE_TAMPER})
+        feed(m, "CAM-A", real_cover(74), t, 20, features={FEATURE_TAMPER})
         st = m._states["CAM-A"]
         self.assertTrue(st.tamper.active)
         # A recovery waits the same window as the raise (see
@@ -701,7 +724,7 @@ class TamperBaselineLifecycleTests(unittest.TestCase):
         a, b = m._states["CAM-A"], m._states["CAM-B"]
         self.assertTrue(a.scene_baseline_valid() and b.scene_baseline_valid())
         self.assertFalse(np.allclose(a.scene_baseline, b.scene_baseline, atol=1e-3))
-        feed(m, "CAM-A", other_scene(79), ta, 20, features={FEATURE_TAMPER})
+        feed(m, "CAM-A", real_cover(79), ta, 20, features={FEATURE_TAMPER})
         feed(m, "CAM-B", scene(78), tb, 20, features={FEATURE_TAMPER})
         self.assertTrue(a.tamper.active)
         self.assertFalse(b.tamper.active, "one camera's tamper must not touch another's")

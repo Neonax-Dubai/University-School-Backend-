@@ -131,8 +131,27 @@ def test_a_degenerate_baseline_leaves_the_gate_as_it_was(monkeypatch):
     assert verdict is None, detail
 
 
-def test_overlap_below_the_gate_is_unaffected(monkeypatch):
-    """Below the gate the rule never applied; sharpness must not change that."""
+def test_overlap_below_the_gate_raises_when_the_image_went_soft(monkeypatch):
+    """Below the structure gate a changed view that ALSO lost sharpness is a cover."""
+    st = _gate_state(monkeypatch, overlap=0.15, sharpness_baseline=4.0)
+    monkeypatch.setattr(D.metrics, "sharpness", lambda g: 0.4)        # ratio 0.10, soft
+    verdict, detail = D.tamper_state(st, np.zeros((4, 4), np.uint8), 10.0, obstructed=False)
+    assert verdict is True, detail
+
+
+def test_overlap_below_the_gate_in_focus_is_rejected(monkeypatch):
+    """ZAYED 2026-11-13 (TAMPER_REQUIRE_SOFT_IMAGE): low overlap with a sharp image is people
+    near the lens or a lighting change, not a cover."""
+    st = _gate_state(monkeypatch, overlap=0.15, sharpness_baseline=4.0)
+    monkeypatch.setattr(D.metrics, "sharpness", lambda g: 4.0)        # ratio 1.0, in focus
+    verdict, detail = D.tamper_state(st, np.zeros((4, 4), np.uint8), 10.0, obstructed=False)
+    assert verdict is None, detail
+    assert "in_focus_rejected" in detail, detail
+
+
+def test_overlap_below_the_gate_in_focus_raises_with_the_switch_off(monkeypatch):
+    """CAMERA_HEALTH_TAMPER_REQUIRE_SOFT_IMAGE=0 restores the previous rule exactly."""
+    monkeypatch.setattr(D, "TAMPER_REQUIRE_SOFT_IMAGE", False)
     st = _gate_state(monkeypatch, overlap=0.15, sharpness_baseline=4.0)
     monkeypatch.setattr(D.metrics, "sharpness", lambda g: 4.0)
     verdict, detail = D.tamper_state(st, np.zeros((4, 4), np.uint8), 10.0, obstructed=False)

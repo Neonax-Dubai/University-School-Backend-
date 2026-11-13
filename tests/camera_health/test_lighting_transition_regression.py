@@ -131,11 +131,34 @@ def test_an_in_focus_scene_is_still_protected(monkeypatch):
     assert detail.get("structure_intact") is True
 
 
-def test_a_low_overlap_sample_is_unaffected_by_the_floor(monkeypatch):
-    """Below the structure gate the rule never applied; sharpness changes nothing."""
+def test_a_low_overlap_soft_sample_still_raises(monkeypatch):
+    """Below the structure gate a cover-like (collapsed-sharpness) sample still raises."""
+    st = _ready_state(monkeypatch, overlap=0.15, sharpness=0.10)
+    verdict, _ = D.tamper_state(st, np.zeros((4, 4), np.uint8), 10.0, obstructed=False)
+    assert verdict is True
+
+
+def test_a_low_overlap_in_focus_sample_needs_the_switch_off_to_raise(monkeypatch):
+    """ZAYED 2026-11-13: in focus is rejected by TAMPER_REQUIRE_SOFT_IMAGE; switched off, the
+    old rule applies unchanged."""
+    st = _ready_state(monkeypatch, overlap=0.15, sharpness=1.0)
+    verdict, _ = D.tamper_state(st, np.zeros((4, 4), np.uint8), 10.0, obstructed=False)
+    assert verdict is None
+    monkeypatch.setattr(D, "TAMPER_REQUIRE_SOFT_IMAGE", False)
     st = _ready_state(monkeypatch, overlap=0.15, sharpness=1.0)
     verdict, _ = D.tamper_state(st, np.zeros((4, 4), np.uint8), 10.0, obstructed=False)
     assert verdict is True
+
+
+@pytest.mark.parametrize("ratio,raises", [
+    # ZAYED 2026-11-13 measured on judged health_sample frames, sharpness / baseline:
+    (0.04, True), (0.27, True),     # genuine 2026-09-30 camera_03 hand-on-lens cover
+    (0.49, False), (1.00, False),   # weakest / typical false raise (people, lighting) 11-10..11-13
+])
+def test_measured_sharpness_ratios_split_covers_from_false_raises(monkeypatch, ratio, raises):
+    st = _ready_state(monkeypatch, overlap=0.15, sharpness=ratio)
+    verdict, detail = D.tamper_state(st, np.zeros((4, 4), np.uint8), 10.0, obstructed=False)
+    assert (verdict is True) is raises, detail
 
 
 def test_no_sharpness_baseline_still_leaves_the_gate_as_it_was(monkeypatch):

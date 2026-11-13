@@ -18,6 +18,21 @@ import helpers  # noqa: F401
 
 import abandoned as ab
 
+
+# ZAYED 2026-11-13: these pin the episode STATE MACHINE as it was written, under the previous
+# alert rule. The empty-view gate (ABANDON_REQUIRE_EMPTY_VIEW) is pinned separately in
+# test_unattended_empty_view.py, so it is switched off here rather than rewriting every scene.
+_SAVED_EMPTY_VIEW = None
+
+
+def setUpModule():
+    global _SAVED_EMPTY_VIEW
+    _SAVED_EMPTY_VIEW, ab.REQUIRE_EMPTY_VIEW = ab.REQUIRE_EMPTY_VIEW, False
+
+
+def tearDownModule():
+    ab.REQUIRE_EMPTY_VIEW = _SAVED_EMPTY_VIEW
+
 CAM = "CAM-R25"
 W, H = 1920, 1080
 BAG = [1143, 645, 1271, 867]            # the real box from the CAM-R25 test

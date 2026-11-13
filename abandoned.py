@@ -102,6 +102,9 @@ docs/ZAYED_UNATTENDED_OBJECT.md):
                                    only SUPPORTED_CLASSES are accepted (ABANDON_CLASS_IDS is the old
                                    name)        (default backpack,handbag,suitcase,laptop,cell phone)
   ABANDON_MIN_OBSERVED_FRACTION    share of the dwell the object must actually be DETECTED (0.3)
+  ABANDON_REQUIRE_EMPTY_VIEW       1 = alert only once nobody is in the camera's view (default 1,
+                                   ZAYED 2026-11-13: left behind, not stepped away)
+  ABANDON_EMPTY_VIEW_SECONDS       how long the view must have been empty            (default 60)
   ABANDON_OBJECT_CONFIDENCE        detector confidence a candidate bag needs (default 0.25)
 """
 import itertools
@@ -128,6 +131,14 @@ MOVE_CONFIRM_SECONDS = _env_float("ABANDON_MOVE_CONFIRM_SECONDS", 1.0)
 MOVE_HANDLING_SECONDS = _env_float("ABANDON_MOVE_HANDLING_SECONDS", 10.0)
 PROXIMITY_FRAC = _env_float("ABANDON_PROXIMITY", 0.12)
 REQUIRE_OWNERLESS = os.getenv("ABANDON_REQUIRE_OWNERLESS", "1") == "1"
+#: ZAYED 2026-11-13 (owner decision): in a classroom an "unattended object" is something LEFT
+#: BEHIND, not a laptop whose student stepped away for half a minute. In C102 the 30 s rule raised
+#: 178 alarms in two days, nearly all laptops on desks of an occupied class. An episode that has
+#: completed its dwell now alerts only once the camera has seen NOBODY for EMPTY_VIEW_SECONDS
+#: continuously; until then it waits on the clock (UNATTENDED), and an owner returning resets it as
+#: before. Set ABANDON_REQUIRE_EMPTY_VIEW=0 to restore the previous rule exactly.
+REQUIRE_EMPTY_VIEW = os.getenv("ABANDON_REQUIRE_EMPTY_VIEW", "1") == "1"
+EMPTY_VIEW_SECONDS = _env_float("ABANDON_EMPTY_VIEW_SECONDS", 60)
 GRACE_SECONDS = _env_float("ABANDON_OWNER_GRACE_SECONDS", 2.0)
 PREALERT_ATTEND_SECONDS = _env_float("ABANDON_PREALERT_ATTEND_SECONDS", 0.0)
 ATTENDED_RESOLVE_SECONDS = _env_float("ABANDON_ATTENDED_RESOLVE_SECONDS", 300.0)
@@ -325,6 +336,7 @@ class AbandonedObjectDetector:
         self._track_episode = {}             # (camera_id, track_id) -> episode_id
         self._resolutions = []               # resolved ALERTED episodes awaiting drain_resolutions()
         self._last_update = {}               # camera_id -> time of its previous update()
+        self._empty_since = {}               # camera_id -> start of the current no-person run
         self._counter = itertools.count(1)
         self._now = 0.0
         self._next_upkeep = None
@@ -348,6 +360,7 @@ class AbandonedObjectDetector:
             del self._track_episode[key]
         self._resolutions = [r for r in self._resolutions if r[0].camera_id != camera_id]
         self._last_update.pop(camera_id, None)
+        self._empty_since.pop(camera_id, None)
 
     # ------------------------------------------------------------------ queries
     def state_for_track(self, camera_id, track_id):
@@ -395,6 +408,10 @@ class AbandonedObjectDetector:
         previous = self._last_update.get(camera_id)
         frame_gap = min(max(now - previous, 0.0), MAX_FRAME_GAP_SECONDS) if previous is not None else 0.0
         self._last_update[camera_id] = now
+        if person_boxes:
+            self._empty_since[camera_id] = None
+        elif self._empty_since.get(camera_id) is None:
+            self._empty_since[camera_id] = now
         prox_radius = PROXIMITY_FRAC * (math.hypot(frame_width, frame_height) or 1.0)
 
         fired, claimed = [], {}
@@ -530,9 +547,20 @@ class AbandonedObjectDetector:
             ep["state"] = UNATTENDED
         dwell = now - ep["unattended_since"]
         if dwell >= self.dwell and ep["observed_seconds"] >= MIN_OBSERVED_FRACTION * self.dwell:
+            empty_for = self.empty_view_seconds(ep["camera_id"], now)
+            if REQUIRE_EMPTY_VIEW and (empty_for is None or empty_for < EMPTY_VIEW_SECONDS):
+                return ep, None                  # left during class: wait until the room is empty
             ep["state"], ep["alerted_at"] = ALERTED, now
-            return ep, (obj, self._alert_metadata(ep, obj, dwell, cx, cy))
+            meta = self._alert_metadata(ep, obj, dwell, cx, cy)
+            if REQUIRE_EMPTY_VIEW:
+                meta["empty_view_seconds"] = round(empty_for, 1)
+            return ep, (obj, meta)
         return ep, None
+
+    def empty_view_seconds(self, camera_id, now):
+        """How long this camera has seen no person at all, or None while someone is in view."""
+        since = self._empty_since.get(camera_id)
+        return None if since is None else max(0.0, now - since)
 
     # ------------------------------------------------------------------ one undetected object
     def _unseen(self, ep, now, frame_gap, person_boxes, prox_radius):
